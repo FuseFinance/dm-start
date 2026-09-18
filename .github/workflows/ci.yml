@@ -1,0 +1,43 @@
+# dm-start CI (OPX-1332, D-c): the launcher's behaviour tests against dm.sh with the fake `claude` on macos-latest,
+# `claude plugin validate --strict` on the plugin on both runners (static: Claude Code from the official installer, no
+# login), and `bash dm.sh --help` under Git Bash on windows-latest. Pester for dm.ps1 arrives with OPX-1339.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Claude Code
+        run: curl -fsSL https://claude.ai/install.sh | bash
+      - name: Validate the plugin
+        run: "$HOME/.local/bin/claude" plugin validate fuse-start --strict
+        env:
+          DISABLE_AUTOUPDATER: "1"
+          DISABLE_TELEMETRY: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      - name: Launcher tests against dm.sh (fake claude)
+        run: FUSE_DM_SCRIPT=dm.sh python3 tests/test_launcher.py
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Claude Code
+        shell: pwsh
+        run: irm https://claude.ai/install.ps1 | iex
+      - name: Validate the plugin
+        shell: bash
+        run: "$HOME/.local/bin/claude" plugin validate fuse-start --strict
+        env:
+          DISABLE_AUTOUPDATER: "1"
+          DISABLE_TELEMETRY: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      - name: dm.sh answers under Git Bash
+        shell: bash
+        run: bash dm.sh --help

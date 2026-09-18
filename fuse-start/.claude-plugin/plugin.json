@@ -1,0 +1,13 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "fuse-start",
+  "version": "1.0.0",
+  "description": "The public bootstrap plugin for the Fuse deployment-manager setup: loaded for one session by the one-line installer (`fuse-dm setup`, `claude --plugin-url`) on a laptop where the private deployment-manager plugin is not installed yet. One skill, /fuse-start:begin.",
+  "author": {
+    "name": "Fuse Finance"
+  },
+  "repository": "https://github.com/FuseFinance/dm-start",
+  "skills": [
+    "./skills/begin"
+  ]
+}
