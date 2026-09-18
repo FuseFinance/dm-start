@@ -16,7 +16,8 @@ jobs:
       - name: Install Claude Code
         run: curl -fsSL https://claude.ai/install.sh | bash
       - name: Validate the plugin
-        run: "$HOME/.local/bin/claude" plugin validate fuse-start --strict
+        run: |
+          "$HOME/.local/bin/claude" plugin validate fuse-start --strict
         env:
           DISABLE_AUTOUPDATER: "1"
           DISABLE_TELEMETRY: "1"
@@ -33,7 +34,8 @@ jobs:
         run: irm https://claude.ai/install.ps1 | iex
       - name: Validate the plugin
         shell: bash
-        run: "$HOME/.local/bin/claude" plugin validate fuse-start --strict
+        run: |
+          "$HOME/.local/bin/claude" plugin validate fuse-start --strict
         env:
           DISABLE_AUTOUPDATER: "1"
           DISABLE_TELEMETRY: "1"
