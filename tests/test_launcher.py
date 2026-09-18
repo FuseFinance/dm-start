@@ -1,7 +1,8 @@
 """Behaviour tests for bin/fuse-dm (OPX-1331): the real script under /bin/bash (3.2 on this Mac) with a fake `claude` in
 a stub bin that is FIRST and ONLY on PATH (the five coreutils the script needs are linked in beside it, so the suite
 also pins that dependency set), a temp HOME, nothing of the machine's. The fake records every invocation as
-$FAKE_DIR/launch.<n> (argv0, one arg= line per argument, the cwd, the env it saw), answers `plugin list` from
+$FAKE_DIR/launch.<n> (argv0, one arg= line per argument, the cwd, the env it saw, and what stdin is — a terminal or
+not, the /dev/tty alias device or not, OPX-1373), answers `plugin list` from
 $FAKE_PLUGIN_LIST, writes the state file when FAKE_CLAUDE_WRITE_STATE tells it to (the nth comma-separated value on the
 nth session launch) and exits with FAKE_CLAUDE_EXIT's nth value, FAKE_CLAUDE_STDERR on stderr — so the relaunch loop,
 the stage choice and the opus retry are all driven from the outside. The real `claude` is never executed.
@@ -11,12 +12,16 @@ Run: python3 deployment-manager/setup/tests/test_launcher.py
 from pathlib import Path
 import json
 import os
+import pty
 import re
+import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 # OPX-1332 (D-b): this file also runs inside the public repo's tree (<checkout>/tests/test_launcher.py beside
@@ -57,6 +62,9 @@ rec="$FAKE_DIR/launch.$n"
 printf 'argv0=%s\n' "$0" > "$rec"
 for a in "$@"; do printf 'arg=%s\n' "$a" >> "$rec"; done
 printf 'cwd=%s\nlauncher=%s\neffort_env=%s\n' "$(pwd -P)" "${FUSE_DM_LAUNCHER:-unset}" "${CLAUDE_CODE_EFFORT_LEVEL:-unset}" >> "$rec"
+# OPX-1373: what stdin is. `-ef` compares device+inode: an fd opened from /dev/tty matches /dev/tty, a dup of the
+# terminal's own fd does not — and the alias device is the one Bun's kqueue refuses.
+printf 'stdin_tty=%s\nstdin_is_dev_tty=%s\n' "$([ -t 0 ] && echo yes || echo no)" "$([ /dev/fd/0 -ef /dev/tty ] && echo yes || echo no)" >> "$rec"
 case "${1:-} ${2:-}" in
   "plugin list") printf '%s\n' "${FAKE_PLUGIN_LIST:-}"; exit 0 ;;
   "plugin marketplace"|"plugin update") exit "${FAKE_UPDATE_RC:-0}" ;;
@@ -126,7 +134,7 @@ class Drive(unittest.TestCase):
         return subprocess.run([BASH, str(script or SCRIPT), *args], env=self.env(**extra), capture_output=True, text=True, timeout=60)
 
     def launches(self):
-        """Every invocation of the fake, in order: {argv0, args, cwd, launcher, effort_env}."""
+        """Every invocation of the fake, in order: {argv0, args, cwd, launcher, effort_env, stdin_tty, stdin_is_dev_tty}."""
         out = []
         for f in sorted(self.fake_dir.glob("launch.*"), key=lambda p: int(p.name.split(".")[1])):
             rec = {"args": []}
@@ -292,6 +300,59 @@ class Launcher(Drive):
         self.assertEqual(s[0]["launcher"], "1")
         self.assertEqual(self.launches()[0]["args"], ["plugin", "list"], "the stage is read from `claude plugin list` first")
         self.assertIn("BASH_SOURCE", SCRIPT.read_text(), "the header says why: BASH_SOURCE is empty when bash reads the script from stdin")
+
+    def test_piped_stub_hands_claude_the_terminal_not_dev_tty(self):
+        """OPX-1373: `curl -fsSL …/dm.sh | bash` typed into Terminal.app — bash reads the script from a pipe (fd 0 is
+        not a terminal) while the process keeps its controlling terminal on fd 1/fd 2. claude is a TUI, so the stub
+        re-opens stdin; it must re-open it as a dup of the launcher's OWN terminal fd, never on /dev/tty. On macOS
+        /dev/tty is the controlling-terminal alias device and kqueue rejects it (EINVAL); Claude Code runs on Bun,
+        which registers stdin with kqueue as it is — Node's libuv re-opens a tty through ttyname, Bun does not — so
+        `exec < /dev/tty` killed part one at its first stdin pull, before the theme picker (the first fresh-account run,
+        2026-09-18). A pty gives the child a real controlling terminal; the script on fd 0 stands in for curl's pipe."""
+        # Everything the child needs is built BEFORE the fork — under xdist this process has threads, and a forked
+        # child that allocates can deadlock. The child only dup2/close/execve, and _exit rather than ever returning
+        # into unittest (a child that returned would run the whole suite a second time).
+        env, script_fd = self.env(), os.open(SCRIPT, os.O_RDONLY)
+        try:
+            pid, master = pty.fork()
+            if pid == 0:
+                try:
+                    os.dup2(script_fd, 0)                  # bash reads the script from a non-tty fd 0, as from the pipe
+                    os.close(script_fd)
+                    os.execve(BASH, [BASH], env)
+                except BaseException:
+                    os._exit(127)
+        finally:
+            os.close(script_fd)                            # the parent's copy; the child kept its own across the fork
+        chunks, finished, deadline = [], False, time.monotonic() + 60
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([master], [], [], left)[0]:
+                break
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:                                # EIO on macOS: the slave side is gone
+                finished = True
+                break
+            if not chunk:                                  # EOF
+                finished = True
+                break
+            chunks.append(chunk)
+        os.close(master)
+        if not finished:
+            os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        term = b"".join(chunks).decode(errors="replace")
+        self.assertTrue(finished, f"the stub did not finish inside 60 s — the terminal said:\n{term}")
+        self.assertEqual(status, 0, f"exit status {status} — the terminal said:\n{term}")
+        s = self.sessions()
+        self.assertEqual(len(s), 1, term)
+        self.assertEqual(s[0]["args"], SETUP_FLAGS + ["--plugin-url", BOOTSTRAP_URL, PART_ONE_PROMPT], term)
+        self.assertEqual(s[0]["launcher"], "1", term)
+        self.assertEqual(s[0]["stdin_tty"], "yes", f"claude is a TUI: the stub puts a terminal back on stdin\n{term}")
+        self.assertEqual(s[0]["stdin_is_dev_tty"], "no",
+                         f"and it is a dup of the launcher's own terminal fd, not the /dev/tty alias device Bun's "
+                         f"kqueue refuses with EINVAL\n{term}")
 
     def test_bare_verb_from_a_file_is_still_daily(self):
         """OPX-1332 (D-a): `fuse-dm` typed — bash reading the script from a file, no argv — stays the daily session."""

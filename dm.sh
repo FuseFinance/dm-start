@@ -9,8 +9,11 @@
 # (which execs the installed plugin's copy of this file, so a plugin update needs no re-install) and the Desktop icon.
 # The same file is published as dm.sh in FuseFinance/dm-start (OPX-1332): the one line `curl -fsSL …/dm.sh | bash`
 # reaches it with no argv and an EMPTY BASH_SOURCE — bash read it from stdin, not from a file — and that case is setup,
-# with stdin re-opened on /dev/tty when one opens (claude is a TUI and stdin is curl's pipe); bare `fuse-dm` from a file
-# stays the daily session.
+# with stdin re-opened as a dup of the launcher's OWN terminal fd (`exec 0<&1`, else `0<&2`) because claude is a TUI and
+# stdin is curl's pipe; /dev/tty is the last resort only, never the first: on macOS /dev/tty is the controlling-terminal
+# alias device and kqueue rejects it (EINVAL), and Claude Code runs on Bun, which registers stdin with kqueue as it is —
+# Node's libuv re-opens a tty through ttyname, Bun does not — so `exec < /dev/tty` killed part one at its first stdin
+# pull, before the theme picker (OPX-1373). Bare `fuse-dm` from a file stays the daily session.
 # bash 3.2 (macOS /bin/bash) and Git Bash run the same file — the bin/fuse-live shape: die/say, seams as FUSE_DM_*
 # environment only (--help), externals kept to mkdir, tee, awk, chmod, rm. Never a settings file, never a default mode.
 # Exit: 0 · 64 usage · 69 a prerequisite is missing · 70 a write failed · else claude's own code.
@@ -196,9 +199,14 @@ do_install_shim() {
 }
 
 # ---- arguments ----
-# No argv and no BASH_SOURCE: the one-line stub (`curl … | bash`) — setup, with the keyboard back for the TUI.
+# No argv and no BASH_SOURCE: the one-line stub (`curl … | bash`) — setup, with the keyboard back for the TUI. The
+# terminal's own fd first (a dup Bun's kqueue accepts), /dev/tty only when neither 1 nor 2 is one — see the header.
+# `exec` and `do_setup` stay inside this one compound: bash is still reading the script from the pipe.
 if [ $# -eq 0 ] && [ -z "${BASH_SOURCE[0]:-}" ]; then
-  if ( : < /dev/tty ) 2>/dev/null; then exec < /dev/tty; fi
+  if [ -t 1 ]; then exec 0<&1
+  elif [ -t 2 ]; then exec 0<&2
+  elif ( : < /dev/tty ) 2>/dev/null; then exec < /dev/tty
+  fi
   do_setup
 fi
 case "${1:-}" in
