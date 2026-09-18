@@ -36,6 +36,10 @@ PLUGIN_DIR = SKILL_DIR.parent
 # OPX-1332 (D-b): FUSE_DM_SCRIPT points the same suite at another copy of the script — the public repo's CI runs it
 # against dm.sh, which the publish script copies from bin/fuse-dm byte for byte.
 SCRIPT = Path(os.environ.get("FUSE_DM_SCRIPT") or PLUGIN_DIR / "bin" / "fuse-dm").resolve()
+# OPX-1339: the Windows entry point beside it — dm.ps1 beside dm.sh in the public tree, bin/fuse-dm.ps1 here. Its
+# behaviour suite is Pester (fuse-dm.Tests.ps1); this file pins the two scripts' shared contract, text against text.
+PS1 = SCRIPT.with_name("dm.ps1") if os.environ.get("FUSE_DM_SCRIPT") else PLUGIN_DIR / "bin" / "fuse-dm.ps1"
+WINDOWS_MD = PLUGIN_DIR / "setup" / "references" / "windows.md"    # absent from the public tree: its pins skip there
 MANIFEST = PLUGIN_DIR / ".claude-plugin" / "plugin.json"
 # the installed fixture mirrors the checkout; the public tree (OPX-1332) has no manifest and the shim reads only installPath
 PLUGIN_VERSION = json.loads(MANIFEST.read_text())["version"] if MANIFEST.is_file() else "unversioned"
@@ -597,12 +601,199 @@ class Shim(Drive):
         self.assertIn('export PATH="$HOME/.fuse/bin:$PATH"', r.stdout)
 
 
+def bash_line(pattern, where="bin/fuse-dm"):
+    """One contract literal read out of the bash script at test time — never a copy kept here (the Drift idiom of
+    bootstrap/tests/test_fuse_start_contracts.py): whichever file changes, the other's pin fails."""
+    match = re.search(pattern, SCRIPT.read_text(), flags=re.M)
+    if not match:
+        raise AssertionError(f"{where}: no line matches {pattern!r}")
+    return match.group(1) if match.groups() else match.group(0)
+
+
+def ps1_text():
+    if not PS1.is_file():
+        raise AssertionError(f"missing: {PS1.name} beside {SCRIPT.name} — the Windows entry point (OPX-1339)")
+    return PS1.read_text(encoding="ascii")
+
+
+def ascii_dash(text):
+    """The bash messages use an em dash; the ps1 is 7-bit ASCII (Windows PowerShell 5.1 reads a BOM-less file as
+    cp1252), so its messages carry ` - ` where bash has ` — `. Everything else is byte-identical."""
+    return text.replace(" — ", " - ")
+
+
+class Parity(unittest.TestCase):
+    """OPX-1339 AC5: bin/fuse-dm.ps1 mirrors bin/fuse-dm verb for verb, flag for flag, message for message. Every contract
+    literal is read FROM the bash script by regex at test time and asserted in the ps1 — in the ps1's spelling where the
+    syntax differs (the table in `test_paths_map_to_the_ps1_spelling`), byte-identical where it must be — and the ps1's
+    own literals are asserted back where bash or windows.md must carry them. Text only: runs everywhere, including the
+    public tree (dm.sh beside dm.ps1)."""
+
+    def test_defaults_and_seams_match_the_bash_script(self):
+        """bash `MODEL="${FUSE_DM_MODEL:-fable}"` ↔ ps1 `Get-FuseDmSetting 'FUSE_DM_MODEL' 'fable'`: the env name and the
+        default value travel together."""
+        text = ps1_text()
+        for var in ("MODEL", "EFFORT", "BOOTSTRAP_URL"):
+            env, default = re.match(r"\$\{(FUSE_DM_\w+):-([^}]*)\}", bash_line(rf'^{var}="(\$\{{[^"]*\}})"$')).groups()
+            with self.subTest(var=var):
+                self.assertIn(f"Get-FuseDmSetting '{env}' '{default}'", text)
+        retry = bash_line(r'^RETRY_MODEL="([a-z-]+)"$')
+        self.assertEqual(retry, "opus")
+        self.assertIn(f"$RetryModel = '{retry}'", text)
+
+    def test_prompts_flags_and_state_words_are_identical(self):
+        text = ps1_text()
+        for literal in (bash_line(r'"(/fuse-start:begin)"'), bash_line(r'"(/deployment-manager:setup)"'),
+                        "--model", "--effort", "--dangerously-skip-permissions", "--plugin-url",
+                        "bootstrap-done", "needs-second-pass", "done"):
+            with self.subTest(literal=literal):
+                self.assertIn(literal, SCRIPT.read_text())
+                self.assertIn(literal, text)
+        # the daily argv: bash `--model "$MODEL" --permission-mode auto` ↔ ps1 `'--model', $script:Model, '--permission-mode', 'auto'`
+        self.assertIn("--model \"$MODEL\" --permission-mode auto", SCRIPT.read_text())
+        self.assertIn("'--model', $script:Model, '--permission-mode', 'auto'", text)
+        for word in ("bootstrap-done", "needs-second-pass"):
+            self.assertIn(f"-eq '{word}'", text, f"the loop tests the state word {word} exactly")
+
+    def test_paths_map_to_the_ps1_spelling(self):
+        """The mapping table — bash spelling ↔ ps1 spelling ($HomeDir is USERPROFILE, then HOME):
+             $HOME/Fuse                    ↔ [IO.Path]::Combine($script:HomeDir, 'Fuse')
+             $HOME/.fuse/dm-setup/state    ↔ [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'state')
+             $HOME/.local/bin/claude       ↔ [IO.Path]::Combine($script:HomeDir, '.local', 'bin', 'claude')
+             --permission-mode auto        ↔ '--permission-mode', 'auto'
+             ` — ` in a message            ↔ ` - `"""
+        bash, text = SCRIPT.read_text(), ps1_text()
+        table = {
+            '"$HOME/Fuse"': "[IO.Path]::Combine($script:HomeDir, 'Fuse')",
+            '"$HOME/.fuse/dm-setup/state"': "[IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'state')",
+            '"$HOME/.local/bin/claude"': "[IO.Path]::Combine($script:HomeDir, '.local', 'bin', 'claude')",
+        }
+        for bash_spelling, ps1_spelling in table.items():
+            with self.subTest(path=bash_spelling):
+                self.assertIn(bash_spelling, bash)
+                self.assertIn(ps1_spelling, text)
+        self.assertIn("~/" + STATE.as_posix(), text, "the help text names the state file as the bash help does")
+
+    def test_messages_match_with_ascii_dashes(self):
+        """The DM-facing lines: the three-things sentence (identical), the retry line, the two closing lines, the
+        update-failed line and the installer line — read from bash, asserted in the ps1 with ` — ` → ` - `."""
+        text = ps1_text()
+        three = bash_line(r'^\s*say "(three things Claude asks the first time[^"]*)"$')
+        self.assertIn(three, text)
+        self.assertNotIn("—", three, "the sentence itself is ASCII: byte-identical in both")
+        for pattern in (r'^\s*say "(this seat refused the model )\$MODEL',
+                        r'^\s*say "(setup finished — from now on double-click Fuse Claude on your Desktop, or type fuse-dm)"$',
+                        r'^\s*say "setup closed \(state: \$\{STATE:-none\}\)( — run fuse-dm setup again to finish; day to day, double-click Fuse Claude on your Desktop, or type fuse-dm)"$',
+                        r'\|\| say "(the plugin update did not go through — the session opens on the copy you have; run fuse-dm update again later)"$',
+                        r'^\s*say "(installing Claude Code — one minute)"$',
+                        r'\|\| say "(the installer did not finish cleanly)"$'):
+            fragment = bash_line(pattern)
+            with self.subTest(fragment=fragment[:40]):
+                self.assertIn(ascii_dash(fragment), text)
+        self.assertIn("- starting again on", text, "the retry line's second half, ASCII")
+
+    def test_env_names_update_lines_and_the_launch_bound(self):
+        text = ps1_text()
+        for env in ("FUSE_DM_MODEL", "FUSE_DM_EFFORT", "FUSE_DM_BOOTSTRAP_URL", "FUSE_DM_INSTALLER", "FUSE_DM_LAUNCHER", "CLAUDE_CODE_EFFORT_LEVEL"):
+            with self.subTest(env=env):
+                self.assertIn(env, SCRIPT.read_text())
+                self.assertIn(env, text)
+        for line in (bash_line(r'"\$CLAUDE" (plugin marketplace update fuse-internal)'), bash_line(r'"\$CLAUDE" (plugin update deployment-manager@fuse-internal)')):
+            with self.subTest(line=line):
+                self.assertIn(line, text)
+        bound = bash_line(r'while \[ "\$n" -lt (\d+) \]')
+        self.assertEqual(bound, "3")
+        self.assertIn(f"while ($n -lt {bound})", text)
+
+    def test_windows_installer_line_is_the_bash_msys_line(self):
+        """bash's msys branch names the official Windows line; the ps1 runs it and names it in the 69 message. The
+        FUSE_DM_INSTALLER seam is a PowerShell expression, run in a CHILD shell (review round 1: the official
+        install.ps1 ends every failure path with an `exit`, which in the launcher's own process would close the DM's
+        console under iex, or end a file run with code 1 instead of 69) — the running host by absolute path, nothing
+        from PATH, the shape of bash's `bash -c "$installer"`."""
+        line = bash_line(r"powershell -command \"(irm https://claude\.ai/install\.ps1 \| iex)\"")
+        text = ps1_text()
+        self.assertIn(f"'{line}'", text)
+        self.assertIn('bash -c "${FUSE_DM_INSTALLER:-', SCRIPT.read_text(), "bash runs the installer in a child process")
+        self.assertIn("[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName", text, "the running host, by absolute path")
+        self.assertIn("-NoProfile -ExecutionPolicy Bypass -Command $installer", text, "the expression runs in that child")
+        self.assertNotIn("Invoke-Expression", text, "never in this process: an `exit` inside the installer would be the launcher's")
+
+    def test_verbs_mirror_and_install_shim_stays_bash(self):
+        """`setup` | (none) | `update` on both; `install-shim` is bash's (the shim and the icon are written under Git
+        Bash): the ps1 names it only to say so, and carries none of the shim's mechanics."""
+        bash, text = SCRIPT.read_text(), ps1_text()
+        for verb in ("setup", "update", "install-shim"):
+            self.assertIn(f"  {verb}) ", bash)
+        self.assertIn("'setup'", text)
+        self.assertIn("'update'", text)
+        self.assertIn("'install-shim'", text)
+        for shim_only in ("installed_plugins.json", "installPath", "Fuse Claude.cmd", "shim_body"):
+            with self.subTest(shim_only=shim_only):
+                self.assertNotIn(shim_only, text)
+        self.assertIn("usage: fuse-dm", text)
+
+    def test_the_ps1_only_seams_are_named_where_they_belong(self):
+        """The Git-for-Windows branch is the ps1's alone: CLAUDE_CODE_GIT_BASH_PATH and the default bash.exe path are
+        what the bash icon already names; FUSE_DM_GIT_BASH is the tests' seam, in the ps1's help and nowhere in bash.
+        Runs everywhere (review round 1: the windows.md half is its own test, so nothing that ran reports skipped)."""
+        text = ps1_text()
+        self.assertIn("FUSE_DM_GIT_BASH", text)
+        self.assertNotIn("FUSE_DM_GIT_BASH", SCRIPT.read_text())
+        self.assertIn("CLAUDE_CODE_GIT_BASH_PATH", text)
+        self.assertIn("Git\\bin\\bash.exe", text)
+        self.assertIn("Git\\bin\\bash.exe", SCRIPT.read_text(), "the bash icon opens the same bash.exe")
+        self.assertIn("https://git-scm.com/downloads/win", text)
+
+    @unittest.skipUnless(WINDOWS_MD.is_file(), "no references/windows.md beside this copy (the public tree)")
+    def test_winget_git_line_is_windows_md_row_two(self):
+        """The ps1's winget line is windows.md row 2's, byte-identical (the Drift idiom), invoked as `& winget …` so
+        the tests' fake winget on PATH is what runs; the variable and the fallback URL are what windows.md names."""
+        text = ps1_text()
+        windows = WINDOWS_MD.read_text()
+        winget = re.search(r"^winget install -e --id Git\.Git$", windows, flags=re.M)
+        self.assertIsNotNone(winget, "windows.md row 2's winget line")
+        self.assertIn("& " + winget.group(0), text)
+        self.assertIn("CLAUDE_CODE_GIT_BASH_PATH", windows)
+        self.assertIn("https://git-scm.com/downloads/win", windows)
+
+    def test_ps1_is_seven_bit_ascii_and_parses_for_5_1(self):
+        """Windows PowerShell 5.1 reads a BOM-less file as cp1252 (raw.githubusercontent serves utf-8): pure ASCII, and
+        none of the PowerShell-7-only syntax the plan rules out."""
+        raw = PS1.read_bytes() if PS1.is_file() else None
+        self.assertIsNotNone(raw, f"missing: {PS1}")
+        self.assertTrue(raw.isascii(), sorted({b for b in raw if b > 127}))
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), "no BOM")
+        text = raw.decode("ascii")
+        for pattern, why in ((r"\?\?", "the null-coalescing operator is PowerShell 7"), (r"\s\?\s.*\s:\s", "the ternary is PowerShell 7"),
+                             (r"\s&&\s", "the && chain is PowerShell 7"), (r"\s\|\|\s", "the || chain is PowerShell 7"),
+                             (r"\$IsWindows", "$IsWindows is PowerShell 6+"), (r"-AsHashtable", "PowerShell 6+"),
+                             (r"\r\n", "LF only: the publish copies bytes")):
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(re.search(pattern, text), why)
+
+    def test_ps1_text_never_names_a_settings_file_or_bypass_permissions(self):
+        """AC2 on the text: no settings file, no bypassPermissions, the bypass flag once (the setup argv), no write to
+        the state file, no `2>&1` on the session (it would pipe stdout and kill the TUI), one `exit` and it is guarded."""
+        text = ps1_text()
+        for bad in ("settings.json", "settings.local.json", "defaultMode", "bypassPermissions", ".claude/settings", ".claude\\settings", "2>&1"):
+            with self.subTest(bad=bad):
+                self.assertNotIn(bad, text)
+        self.assertEqual(text.count("--dangerously-skip-permissions"), 1)
+        self.assertNotRegex(text, r"(?m)^.*StateFile.*(Set-Content|Out-File|Add-Content|WriteAllText|WriteAllLines|\s>\s).*$", "the launcher only reads the state file")
+        exits = [l for l in text.splitlines() if "exit " in l]
+        self.assertEqual(len(exits), 1, exits)
+        self.assertIn("$PSCommandPath", exits[0], "under iex the body returns; only a file run exits")
+
+
 class Hygiene(unittest.TestCase):
     def test_no_machine_paths_or_secrets(self):
-        for f in (SCRIPT, Path(__file__)):
+        for f in (SCRIPT, PS1, Path(__file__)):
             with self.subTest(file=f.name):
-                text = f.read_text()
+                text = f.read_text() if f.is_file() else ""
+                self.assertTrue(text, f"missing: {f}")
                 self.assertNotIn("/" + "Users/", text)
+                self.assertNotIn("\\" + "Users\\", text)
                 self.assertIsNone(re.search(r"\b[0-9a-f]{40}\b", text))
 
 

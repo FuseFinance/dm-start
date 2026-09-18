@@ -1,11 +1,13 @@
-# dm-start CI (OPX-1332, D-c): the launcher's behaviour tests against dm.sh with the fake `claude` on macos-latest,
-# `claude plugin validate --strict` on the plugin on both runners (static: Claude Code from the official installer, no
-# login), and `bash dm.sh --help` under Git Bash on windows-latest. Pester for dm.ps1 arrives with OPX-1339.
+# dm-start CI (OPX-1332, D-c; OPX-1339): the launcher's behaviour tests against dm.sh with the fake `claude` on
+# macos-latest, `claude plugin validate --strict` on the plugin on both runners (static: Claude Code from the official
+# installer, no login), `bash dm.sh --help` under Git Bash on windows-latest, and the Pester suite against dm.ps1 on
+# windows-latest — under Windows PowerShell 5.1 (the DM's shell) first, then under pwsh — with the fake `claude` and the
+# fake `winget`, nothing of the runner's. Every branch runs it: the windows-latest rounds of a change to dm.ps1 happen on
+# a branch before main.
 name: ci
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
@@ -43,3 +45,30 @@ jobs:
       - name: dm.sh answers under Git Bash
         shell: bash
         run: bash dm.sh --help
+      - name: Pester against dm.ps1 (Windows PowerShell 5.1, fake claude and winget)
+        shell: powershell
+        timeout-minutes: 15
+        env:
+          FUSE_DM_SCRIPT: dm.ps1
+        run: |
+          Install-Module Pester -Force -SkipPublisherCheck -Scope CurrentUser -MinimumVersion 5.0
+          Import-Module Pester -MinimumVersion 5.0 -Force
+          $c = New-PesterConfiguration
+          $c.Run.Path = 'tests/fuse-dm.Tests.ps1'
+          $c.Run.Exit = $true
+          $c.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $c
+      - name: Pester against dm.ps1 (pwsh)
+        shell: pwsh
+        timeout-minutes: 15
+        env:
+          FUSE_DM_SCRIPT: dm.ps1
+          FUSE_DM_TEST_SHELL: pwsh
+        run: |
+          Install-Module Pester -Force -SkipPublisherCheck -Scope CurrentUser -MinimumVersion 5.0
+          Import-Module Pester -MinimumVersion 5.0 -Force
+          $c = New-PesterConfiguration
+          $c.Run.Path = 'tests/fuse-dm.Tests.ps1'
+          $c.Run.Exit = $true
+          $c.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $c
