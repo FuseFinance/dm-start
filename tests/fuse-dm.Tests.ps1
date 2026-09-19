@@ -186,12 +186,19 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
             # the official line's own shape - text piped into iex, no script boundary: an `exit` inside it is the caller's
             return "Get-Content -Raw '" + $Path + "' | Invoke-Expression"
         }
+        function Get-StubName([string]$Name) {
+            # the wrapper's file name on this platform: `winget` is winget.cmd on Windows (Write-Wrapper's rule), bare
+            # elsewhere; a name that already carries .cmd (the claude wrapper's $script:WrapperName) is left alone.
+            # CI round 1: Add-Stub 'winget' / 'git' joined the bare name on windows-latest and the link's target was missing.
+            if ($script:OnWindows -and -not $Name.ToLower().EndsWith('.cmd')) { return ($Name + '.cmd') }
+            return $Name
+        }
         function Add-Stub([string]$Name) {
             # a hard link into the case's bin (the assessed inode, not a fresh file)
-            $source = Join-Path $script:Stub $Name
-            New-Item -ItemType HardLink -Path (Join-Path $script:T.Bin $Name) -Target $source | Out-Null
+            $file = Get-StubName $Name
+            New-Item -ItemType HardLink -Path (Join-Path $script:T.Bin $file) -Target (Join-Path $script:Stub $file) | Out-Null
         }
-        function Remove-Stub([string]$Name) { Remove-Item -LiteralPath (Join-Path $script:T.Bin $Name) -Force }
+        function Remove-Stub([string]$Name) { Remove-Item -LiteralPath (Join-Path $script:T.Bin (Get-StubName $Name)) -Force }
         function Reset-Fake {
             Remove-Item -LiteralPath $script:T.Fake -Recurse -Force -ErrorAction SilentlyContinue
             New-Item -ItemType Directory -Path $script:T.Fake -Force | Out-Null
