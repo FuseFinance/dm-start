@@ -862,7 +862,10 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
             $r.Code | Should -Be 0 -Because $r.Err
             $r.Out | Should -BeLike '*keep-current*'
             $r.Out | Should -BeLike '*~/.fuse/dm-setup/plugin-version*'
-            (Get-Text).Split('param(')[0] | Should -BeLike '*keep-current*' -Because 'the header comment says it'
+            # the text before the first `param(` by IndexOf/Substring: Windows PowerShell 5.1 (.NET Framework) has no
+            # String.Split(string) overload - 'param(' would become a char[] and the split would land on the m of fuse-dm
+            $t = Get-Text
+            $t.Substring(0, $t.IndexOf('param(')) | Should -BeLike '*keep-current*' -Because 'the header comment says it'
         }
     }
 
