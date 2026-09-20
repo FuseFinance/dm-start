@@ -50,7 +50,11 @@ SETUP_FLAGS = ["--model", "fable", "--effort", "medium", "--dangerously-skip-per
 DAILY_ARGV = ["--model", "fable", "--permission-mode", "auto"]
 PART_ONE_PROMPT = "/fuse-start:begin"
 PART_TWO_PROMPT = "/deployment-manager:setup"
+# OPX-1366 (S-6): the keep-current pass — setup's second pass, opened by the daily launch when the plugin version moved
+KEEP_CURRENT_PROMPT = "/deployment-manager:setup keep-current"
 STATE = Path(".fuse") / "dm-setup" / "state"
+RECORD = Path(".fuse") / "dm-setup" / "plugin-version"       # the launcher's own file: the version it last ran a pass for
+INSTALLED_PLUGINS = Path(".claude") / "plugins" / "installed_plugins.json"
 SHIM = Path(".fuse") / "bin" / "fuse-dm"
 # The externals the script may call (`bash` is what the shim execs the plugin's copy with). Anything else is a
 # `command not found` under the bare PATH — the dependency set is part of the contract (Git Bash ships all of them).
@@ -601,6 +605,131 @@ class Shim(Drive):
         self.assertIn('export PATH="$HOME/.fuse/bin:$PATH"', r.stdout)
 
 
+class KeepCurrent(Drive):
+    """OPX-1366 (S-6, AC1): the daily launch and `update` compare the installed deployment-manager version (from
+    installed_plugins.json — the shim's awk, no claude process) with the one recorded at ~/.fuse/dm-setup/plugin-version,
+    the launcher's own file beside the state word (setup rewrites `state` whole, so the record is not a second line of
+    it). Moved → the session opens on setup's keep-current pass: the daily argv with the prompt as its last token, auto
+    mode, no bypass, one line said first, and the record rewritten after a clean exit. Equal → today's daily, nothing
+    written. No record (a machine set up before S-6) → today's daily, no pass forced, the version recorded after a clean
+    exit so the next release is caught. Unknown installed version → nothing. A non-zero exit records nothing."""
+
+    # fixture versions, never the plugin's own (scripts/tests/test_version_single_source.py: no test carries the current version literal)
+    OLD, NEW = "0.0.1", "0.0.2"
+
+    def installed(self, version):
+        """installed_plugins.json as Claude Code writes it: pretty-printed, the entry an array of one object."""
+        f = self.home / INSTALLED_PLUGINS
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps({"version": 2, "plugins": {"deployment-manager@fuse-internal": [
+            {"scope": "user", "installPath": str(self.tmp / "cache" / version), "version": version, "isLocal": False}]}}, indent=2) + "\n")
+
+    def record(self, version):
+        f = self.home / RECORD
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(version + "\n")
+
+    def recorded(self):
+        f = self.home / RECORD
+        return f.read_text().strip() if f.exists() else None
+
+    def said(self, r):
+        return [l for l in r.stdout.splitlines() if "re-checking" in l]
+
+    def test_a_moved_version_opens_the_keep_current_pass_and_rewrites_the_record(self):
+        self.installed(self.NEW); self.record(self.OLD)
+        r = self.run_dm()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.sessions()
+        self.assertEqual(len(s), 1)
+        self.assertEqual(s[0]["args"], DAILY_ARGV + [KEEP_CURRENT_PROMPT], "the daily argv, the pass's prompt as the last token")
+        self.assertEqual(Path(s[0]["cwd"]).resolve(), (self.home / "Fuse").resolve())
+        self.assertEqual(s[0]["launcher"], "unset", "a daily session: no FUSE_DM_LAUNCHER")
+        self.assertEqual(s[0]["effort_env"], "unset", "the seat's effort")
+        self.assertEqual(len(self.launches()), 1, "no plugin list: the version is read from installed_plugins.json")
+        self.assertEqual(self.recorded(), self.NEW, "the record is rewritten after a clean exit")
+        said = self.said(r)
+        self.assertEqual(len(said), 1, r.stdout)
+        self.assertIn(self.NEW, said[0])
+        self.assertTrue(said[0].startswith("fuse-dm: "))
+
+    def test_the_same_version_is_todays_daily_and_writes_nothing(self):
+        self.installed(self.NEW); self.record(self.NEW)
+        before = (self.home / RECORD).stat().st_mtime_ns
+        r = self.run_dm()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.sessions()[0]["args"], DAILY_ARGV)
+        self.assertEqual(self.said(r), [])
+        self.assertEqual((self.home / RECORD).stat().st_mtime_ns, before, "not rewritten")
+        self.assertEqual(self.recorded(), self.NEW)
+
+    def test_no_record_is_todays_daily_and_records_the_installed_version(self):
+        """A machine that ran setup before S-6: no pass forced today, and the baseline written so the next release is."""
+        self.installed(self.NEW)
+        r = self.run_dm()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.sessions()[0]["args"], DAILY_ARGV, "no pass forced")
+        self.assertEqual(self.said(r), [])
+        self.assertEqual(self.recorded(), self.NEW, "recorded after the clean exit")
+        self.assertIsNone(self.state(), "the state file is not the launcher's to write")
+
+    def test_an_unknown_installed_version_changes_nothing(self):
+        """No installed_plugins.json, or one awk cannot read: today's daily, no record written, a record kept."""
+        for shape, keep in (("missing", False), ("malformed", False), ("missing", True)):
+            with self.subTest(shape=shape, record=keep):
+                shutil.rmtree(self.fake_dir); self.fake_dir.mkdir()
+                shutil.rmtree(self.home / ".fuse", ignore_errors=True)
+                shutil.rmtree(self.home / ".claude", ignore_errors=True)
+                if shape == "malformed":
+                    (self.home / INSTALLED_PLUGINS).parent.mkdir(parents=True)
+                    (self.home / INSTALLED_PLUGINS).write_text("{not json")
+                if keep:
+                    self.record(self.OLD)
+                r = self.run_dm()
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(self.sessions()[0]["args"], DAILY_ARGV)
+                self.assertEqual(self.said(r), [])
+                self.assertEqual(self.recorded(), self.OLD if keep else None)
+
+    def test_a_non_zero_exit_records_nothing(self):
+        self.installed(self.NEW); self.record(self.OLD)
+        r = self.run_dm(FAKE_CLAUDE_EXIT="3", FAKE_CLAUDE_STDERR="Error: something else broke")
+        self.assertEqual(r.returncode, 3, "claude's own code")
+        self.assertEqual(self.sessions()[0]["args"], DAILY_ARGV + [KEEP_CURRENT_PROMPT])
+        self.assertEqual(self.recorded(), self.OLD, "the pass did not complete: the record stays, so the next launch runs it again")
+
+    def test_update_runs_the_same_check_after_the_two_update_lines(self):
+        """`fuse-dm update` is where the version moves: the check runs after the two update lines, on the new file."""
+        self.installed(self.NEW); self.record(self.OLD)
+        r = self.run_dm("update")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([l["args"] for l in self.launches()],
+                         [["plugin", "marketplace", "update", "fuse-internal"],
+                          ["plugin", "update", "deployment-manager@fuse-internal"],
+                          DAILY_ARGV + [KEEP_CURRENT_PROMPT]])
+        self.assertEqual(self.recorded(), self.NEW)
+        self.assertEqual(len(self.said(r)), 1)
+        for bad in ("--dangerously-skip-permissions", "bypassPermissions", "--plugin-url"):
+            self.assertNotIn(bad, " ".join(self.launches()[-1]["args"]))
+
+    def test_setup_records_the_version_when_the_loop_ends_done(self):
+        """`fuse-dm setup` that ends with `done` writes the baseline too — read after the passes, since part one is
+        what installs the plugin."""
+        self.installed(self.NEW)
+        r = self.run_dm("setup", FAKE_PLUGIN_LIST=PLUGIN_LIST_PRESENT, FAKE_CLAUDE_WRITE_STATE="done")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.recorded(), self.NEW)
+        self.assertEqual(self.state(), "done", "the state word is setup's, untouched")
+
+    def test_help_and_header_say_what_the_daily_verb_does_now(self):
+        r = self.run_dm("--help", PATH=str(self.bin))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for token in ("keep-current", "~/" + RECORD.as_posix()):
+            with self.subTest(token=token):
+                self.assertIn(token, r.stdout)
+        self.assertIn("keep-current", SCRIPT.read_text().split("set -u", 1)[0], "the header comment says it")
+
+
 def bash_line(pattern, where="bin/fuse-dm"):
     """One contract literal read out of the bash script at test time — never a copy kept here (the Drift idiom of
     bootstrap/tests/test_fuse_start_contracts.py): whichever file changes, the other's pin fails."""
@@ -644,6 +773,7 @@ class Parity(unittest.TestCase):
     def test_prompts_flags_and_state_words_are_identical(self):
         text = ps1_text()
         for literal in (bash_line(r'"(/fuse-start:begin)"'), bash_line(r'"(/deployment-manager:setup)"'),
+                        bash_line(r'"(/deployment-manager:setup keep-current)"'),      # OPX-1366: the keep-current pass's prompt
                         "--model", "--effort", "--dangerously-skip-permissions", "--plugin-url",
                         "bootstrap-done", "needs-second-pass", "done"):
             with self.subTest(literal=literal):
@@ -659,6 +789,7 @@ class Parity(unittest.TestCase):
         """The mapping table — bash spelling ↔ ps1 spelling ($HomeDir is USERPROFILE, then HOME):
              $HOME/Fuse                    ↔ [IO.Path]::Combine($script:HomeDir, 'Fuse')
              $HOME/.fuse/dm-setup/state    ↔ [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'state')
+             $HOME/.fuse/dm-setup/plugin-version ↔ [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'plugin-version')   (OPX-1366)
              $HOME/.local/bin/claude       ↔ [IO.Path]::Combine($script:HomeDir, '.local', 'bin', 'claude')
              --permission-mode auto        ↔ '--permission-mode', 'auto'
              ` — ` in a message            ↔ ` - `"""
@@ -666,6 +797,7 @@ class Parity(unittest.TestCase):
         table = {
             '"$HOME/Fuse"': "[IO.Path]::Combine($script:HomeDir, 'Fuse')",
             '"$HOME/.fuse/dm-setup/state"': "[IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'state')",
+            '"$HOME/.fuse/dm-setup/plugin-version"': "[IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'plugin-version')",
             '"$HOME/.local/bin/claude"': "[IO.Path]::Combine($script:HomeDir, '.local', 'bin', 'claude')",
         }
         for bash_spelling, ps1_spelling in table.items():
@@ -673,6 +805,7 @@ class Parity(unittest.TestCase):
                 self.assertIn(bash_spelling, bash)
                 self.assertIn(ps1_spelling, text)
         self.assertIn("~/" + STATE.as_posix(), text, "the help text names the state file as the bash help does")
+        self.assertIn("~/" + RECORD.as_posix(), text, "and the version record (OPX-1366)")
 
     def test_messages_match_with_ascii_dashes(self):
         """The DM-facing lines: the three-things sentence (identical), the retry line, the two closing lines, the
@@ -686,11 +819,13 @@ class Parity(unittest.TestCase):
                         r'^\s*say "setup closed \(state: \$\{STATE:-none\}\)( — run fuse-dm setup again to finish; day to day, double-click Fuse Claude on your Desktop, or type fuse-dm)"$',
                         r'\|\| say "(the plugin update did not go through — the session opens on the copy you have; run fuse-dm update again later)"$',
                         r'^\s*say "(installing Claude Code — one minute)"$',
-                        r'\|\| say "(the installer did not finish cleanly)"$'):
+                        r'\|\| say "(the installer did not finish cleanly)"$',
+                        r'^\s*say "the plugin moved to \$INSTALLED( — re-checking the environment first, seconds)"$'):   # OPX-1366
             fragment = bash_line(pattern)
             with self.subTest(fragment=fragment[:40]):
                 self.assertIn(ascii_dash(fragment), text)
         self.assertIn("- starting again on", text, "the retry line's second half, ASCII")
+        self.assertIn("'the plugin moved to '", text, "the keep-current line's first half (OPX-1366)")
 
     def test_env_names_update_lines_and_the_launch_bound(self):
         text = ps1_text()
@@ -721,14 +856,17 @@ class Parity(unittest.TestCase):
 
     def test_verbs_mirror_and_install_shim_stays_bash(self):
         """`setup` | (none) | `update` on both; `install-shim` is bash's (the shim and the icon are written under Git
-        Bash): the ps1 names it only to say so, and carries none of the shim's mechanics."""
+        Bash): the ps1 names it only to say so, and carries none of the shim's mechanics. OPX-1366: both scripts read
+        the installed version from installed_plugins.json now, so that name leaves the shim-only tuple; `installPath`
+        stays shim-only (the ps1 reads `version`, never the path)."""
         bash, text = SCRIPT.read_text(), ps1_text()
         for verb in ("setup", "update", "install-shim"):
             self.assertIn(f"  {verb}) ", bash)
         self.assertIn("'setup'", text)
         self.assertIn("'update'", text)
         self.assertIn("'install-shim'", text)
-        for shim_only in ("installed_plugins.json", "installPath", "Fuse Claude.cmd", "shim_body"):
+        self.assertIn("installed_plugins.json", text)
+        for shim_only in ("installPath", "Fuse Claude.cmd", "shim_body"):
             with self.subTest(shim_only=shim_only):
                 self.assertNotIn(shim_only, text)
         self.assertIn("usage: fuse-dm", text)

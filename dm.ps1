@@ -5,7 +5,13 @@
 # `claude plugin list` (the bootstrap plugin's part one, or setup's part two), the session with the setup flags, and
 # after each session ~/.fuse/dm-setup/state decides whether another pass follows - at most three launches. A bare
 # `fuse-dm.ps1` from a file is the daily session: Fable, auto mode, ~/Fuse, no bypass flag, ever. `fuse-dm.ps1 update`
-# runs the plugin update ritual, then the daily session. `install-shim` is NOT here: the shim at ~/.fuse/bin/fuse-dm and
+# runs the plugin update ritual, then the daily session. Both keep the machine current (OPX-1366, S-6): the launcher
+# records the deployment-manager version it last ran a pass for in ~/.fuse/dm-setup/plugin-version (its own file -
+# setup rewrites `state` whole) and reads the installed one from installed_plugins.json (ConvertFrom-Json, no claude
+# process); moved -> the daily session opens on setup's keep-current pass, the prompt "/deployment-manager:setup
+# keep-current" as the last token of the same daily argv, one line said first, and the record is rewritten after a
+# clean run (code 0); equal -> nothing; no record -> today's daily and the version recorded after a clean run; unknown
+# (no file, a malformed file) -> nothing. `install-shim` is NOT here: the shim at ~/.fuse/bin/fuse-dm and
 # the Desktop icon are written by the plugin's bash copy under Git Bash (setup's row 14), and the icon execs that copy.
 # The same file is published as dm.ps1 in FuseFinance/dm-start: the one line `irm .../dm.ps1 | iex` runs this text in
 # the DM's own PowerShell with no argument and an EMPTY $PSCommandPath (there is no file) - that case is setup, the
@@ -44,8 +50,14 @@ if (-not $HomeDir) { $HomeDir = $env:HOME }
 if (-not $HomeDir) { $HomeDir = [string]$HOME }
 $RootDir = [IO.Path]::Combine($script:HomeDir, 'Fuse')
 $StateFile = [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'state')   # read only: the bootstrap plugin and setup write it
+$VersionFile = [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'plugin-version')   # the launcher's own: the plugin version it last ran a pass for
+$InstalledPlugins = [IO.Path]::Combine($script:HomeDir, '.claude', 'plugins', 'installed_plugins.json')
+$KeepCurrentPrompt = '/deployment-manager:setup keep-current'
 $Claude = $null
 $Retried = $false
+$Installed = ''
+$Recorded = ''
+$KeepCurrent = $false
 
 function Say([string]$Message) { Write-Host ('fuse-dm: ' + $Message) }
 function Die([string]$Message, [int]$Code) { [Console]::Error.WriteLine('fuse-dm: ' + $Message); return $Code }
@@ -57,9 +69,12 @@ function Show-Help {
         '  setup         install or finish the Fuse environment: part one (the bootstrap plugin) when deployment-manager is',
         '                not installed, part two (/deployment-manager:setup) when it is; another pass follows when',
         '                ~/.fuse/dm-setup/state says so (bootstrap-done, needs-second-pass); at most three launches',
-        '  (none)        the daily session: claude on Fable, auto mode, in ~/Fuse - prompts on, no bypass',
+        '  (none)        the daily session: claude on Fable, auto mode, in ~/Fuse - prompts on, no bypass; when the installed',
+        '                deployment-manager version differs from ~/.fuse/dm-setup/plugin-version (the one the last pass ran',
+        '                for), the session opens on /deployment-manager:setup keep-current - every row re-checked, seconds -',
+        '                and the record is rewritten after a clean run; no record yet -> the daily session, the version recorded',
         '  update        claude plugin marketplace update fuse-internal, claude plugin update deployment-manager@fuse-internal,',
-        '                then the daily session',
+        '                then the daily session, with the same keep-current check',
         '  install-shim  not here: the shim at ~/.fuse/bin/fuse-dm and the Desktop icon are written by the plugin''s bash',
         '                copy, under Git Bash (bash "$ROOT/bin/fuse-dm" install-shim)',
         '',
@@ -148,6 +163,48 @@ function Read-State {
     return $state
 }
 
+# ---- keep current (OPX-1366): the installed deployment-manager version from installed_plugins.json (Test-Path, then
+# Get-Content -Raw | ConvertFrom-Json in a try; the entry is an array, its first object's `version`; a missing or
+# malformed file = unknown = ''), the record from ~/.fuse/dm-setup/plugin-version (the launcher's own file: setup
+# rewrites `state` whole, so this is not a second line of it). Different -> $KeepCurrent and one line said; the record
+# is written only after a clean run. ----
+function Get-InstalledVersion {
+    if (-not (Test-Path -LiteralPath $script:InstalledPlugins -PathType Leaf)) { return '' }
+    try {
+        $json = Get-Content -LiteralPath $script:InstalledPlugins -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $entries = @($json.plugins.'deployment-manager@fuse-internal')
+        if ($entries.Count -gt 0 -and $null -ne $entries[0] -and $entries[0].version) { return [string]$entries[0].version }
+    } catch { }
+    return ''
+}
+function Read-Record {
+    if (Test-Path -LiteralPath $script:VersionFile -PathType Leaf) {
+        $first = @(Get-Content -LiteralPath $script:VersionFile -TotalCount 1)
+        if ($first.Count -gt 0 -and $null -ne $first[0]) { return ([string]$first[0]).Trim() }
+    }
+    return ''
+}
+function Test-KeepCurrent {
+    $script:KeepCurrent = $false
+    $script:Recorded = ''
+    $script:Installed = Get-InstalledVersion
+    if (-not $script:Installed) { return }
+    $script:Recorded = Read-Record
+    if ($script:Recorded -and $script:Recorded -ne $script:Installed) {
+        $script:KeepCurrent = $true
+        Say ('the plugin moved to ' + $script:Installed + ' - re-checking the environment first, seconds')
+    }
+}
+function Write-Record {
+    # after a clean run only; nothing to write when the version is unknown or already recorded
+    if ((-not $script:Installed) -or ($script:Recorded -eq $script:Installed)) { return }
+    try {
+        $dir = Split-Path -Parent $script:VersionFile
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+        [IO.File]::WriteAllText($script:VersionFile, $script:Installed + "`n")
+    } catch { Say ('could not record the plugin version at ' + $script:VersionFile + ' - the next launch re-checks the environment again') }
+}
+
 # ---- one session: claude in ~/Fuse, the argv rebuilt from the current model; stdin and stdout on the console (the
 # TUI), stderr captured to a file so a model refusal (non-zero, and stderr names the model) can be told from any other
 # exit, and printed back after a non-zero one so the DM sees it. A refusal retries once with opus and keeps it for the
@@ -170,6 +227,7 @@ function Start-Session([string]$Kind, [string]$Stage) {
         else { $argv += @('/deployment-manager:setup') }
     } else {
         $argv = @('--model', $script:Model, '--permission-mode', 'auto')
+        if ($script:KeepCurrent) { $argv += @($script:KeepCurrentPrompt) }   # setup's keep-current pass, the prompt last
     }
     if (-not (Test-Path -LiteralPath $script:RootDir -PathType Container)) {
         try { New-Item -ItemType Directory -Path $script:RootDir -Force -ErrorAction Stop | Out-Null }
@@ -224,6 +282,7 @@ function Invoke-Setup {
         if ($state -eq 'bootstrap-done' -or $state -eq 'needs-second-pass') { $stage = 'two' } else { break }
     }
     if ($state -eq 'done') {
+        $script:Installed = Get-InstalledVersion; $script:Recorded = ''; Write-Record   # read after the passes: part one installs the plugin
         Say 'setup finished - from now on double-click Fuse Claude on your Desktop, or type fuse-dm'
     } else {
         $shown = $state
@@ -233,11 +292,14 @@ function Invoke-Setup {
     return 0
 }
 
-# ---- daily, and update-then-daily ----
+# ---- daily, and update-then-daily: the keep-current check before the launch, the record after a clean run ----
 function Invoke-Daily {
     $code = Confirm-Claude
     if ($code -ne 0) { return $code }
-    return (Start-Session 'daily' '')
+    Test-KeepCurrent
+    $rc = Start-Session 'daily' ''
+    if ($rc -eq 0) { Write-Record }
+    return $rc
 }
 function Invoke-Update {
     $code = Confirm-Claude
@@ -249,7 +311,10 @@ function Invoke-Update {
         $ok = ($LASTEXITCODE -eq 0)
     }
     if (-not $ok) { Say 'the plugin update did not go through - the session opens on the copy you have; run fuse-dm update again later' }
-    return (Start-Session 'daily' '')
+    Test-KeepCurrent
+    $rc = Start-Session 'daily' ''
+    if ($rc -eq 0) { Write-Record }
+    return $rc
 }
 
 # ---- arguments ----

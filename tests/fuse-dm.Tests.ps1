@@ -175,6 +175,7 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
         $script:DailyArgv = @('--model', 'fable', '--permission-mode', 'auto')
         $script:PartOne = '/fuse-start:begin'
         $script:PartTwo = '/deployment-manager:setup'
+        $script:KeepCurrentPrompt = '/deployment-manager:setup keep-current'   # OPX-1366: setup's second pass, opened by the daily launch
         $script:Refusal = "Error: the model 'fable' is not available on this account"
 
         function Set-Env([string]$Name, $Value) {
@@ -268,6 +269,49 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
             $f = Join-Path $script:T.Fake 'installer.txt'
             if (Test-Path -LiteralPath $f) { return @([IO.File]::ReadAllLines($f)).Count }
             return 0
+        }
+        # OPX-1366: the installed version (installed_plugins.json as Claude Code writes it - pretty-printed, the entry an
+        # array of one object) and the launcher's own record beside the state word; the versions are fixtures, never the
+        # plugin's own (the Python suite's rule, scripts/tests/test_version_single_source.py)
+        function Set-InstalledPlugins([string]$Version) {
+            $dir = [IO.Path]::Combine($script:T.Home, '.claude', 'plugins')
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            $text = @"
+{
+  "version": 2,
+  "plugins": {
+    "deployment-manager@fuse-internal": [
+      {
+        "scope": "user",
+        "installPath": "/plugins/cache/fuse-internal/deployment-manager/$Version",
+        "version": "$Version",
+        "isLocal": false
+      }
+    ]
+  }
+}
+"@
+            [IO.File]::WriteAllText((Join-Path $dir 'installed_plugins.json'), $text)
+        }
+        function Set-MalformedInstalledPlugins {
+            $dir = [IO.Path]::Combine($script:T.Home, '.claude', 'plugins')
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            [IO.File]::WriteAllText((Join-Path $dir 'installed_plugins.json'), '{not json')
+        }
+        function Set-Record([string]$Version) {
+            $dir = [IO.Path]::Combine($script:T.Home, '.fuse', 'dm-setup')
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            [IO.File]::WriteAllText((Join-Path $dir 'plugin-version'), $Version + "`n")
+        }
+        function Get-Record {
+            $f = [IO.Path]::Combine($script:T.Home, '.fuse', 'dm-setup', 'plugin-version')
+            if (Test-Path -LiteralPath $f) { return [IO.File]::ReadAllText($f).Trim() }
+            return $null
+        }
+        function Get-Said($R) {
+            # the launcher's keep-current line(s), as an array even when there is one (the `return ,` idiom above)
+            $lines = @($R.Out -split "`r?`n" | Where-Object { $_ -like '*re-checking*' })
+            return ,$lines
         }
         function Get-WingetArgv {
             $f = Join-Path $script:T.Fake 'winget.txt'
@@ -713,6 +757,112 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
             $s = Get-Sessions
             $s.Count | Should -Be 2
             Get-Argv $s[1] | Should -BeExactly '--model opus --permission-mode auto'
+        }
+    }
+
+    Describe 'KeepCurrent' {
+        # OPX-1366 (S-6, AC1/AC8): the daily launch and `update` compare the installed deployment-manager version
+        # (installed_plugins.json, ConvertFrom-Json) with ~/.fuse/dm-setup/plugin-version, the launcher's own record beside
+        # the state word. Moved -> the daily argv with the keep-current prompt as its last token, one line said first, the
+        # record rewritten after a clean exit; equal -> today's daily, nothing written; no record -> today's daily and the
+        # version recorded; unknown -> nothing; a non-zero exit records nothing. Mirrors test_launcher.py's KeepCurrent.
+
+        It 'a moved version opens the keep-current pass and rewrites the record' {
+            Set-InstalledPlugins '0.0.2'
+            Set-Record '0.0.1'
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            $s = Get-Sessions
+            $s.Count | Should -Be 1
+            Get-Argv $s[0] | Should -BeExactly (($script:DailyArgv + @($script:KeepCurrentPrompt)) -join ' ') -Because 'the daily argv, the prompt as the last token'
+            $s[0].Cwd | Should -Be (Join-Path $script:T.Home 'Fuse')
+            $s[0].Launcher | Should -BeExactly 'unset' -Because 'a daily session: no FUSE_DM_LAUNCHER'
+            $s[0].EffortEnv | Should -BeExactly 'unset'
+            (Get-Launches).Count | Should -Be 1 -Because 'no plugin list: the version is read from installed_plugins.json'
+            Get-Record | Should -BeExactly '0.0.2' -Because 'the record is rewritten after a clean exit'
+            $said = Get-Said $r
+            $said.Count | Should -Be 1 -Because $r.Out
+            $said[0] | Should -BeLike 'fuse-dm: *0.0.2*'
+        }
+
+        It 'the same version is today''s daily and writes nothing' {
+            Set-InstalledPlugins '0.0.2'
+            Set-Record '0.0.2'
+            $f = [IO.Path]::Combine($script:T.Home, '.fuse', 'dm-setup', 'plugin-version')
+            $before = [IO.File]::GetLastWriteTimeUtc($f)
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            Get-Argv (Get-Sessions)[0] | Should -BeExactly ($script:DailyArgv -join ' ')
+            (Get-Said $r).Count | Should -Be 0
+            [IO.File]::GetLastWriteTimeUtc($f) | Should -Be $before -Because 'not rewritten'
+            Get-Record | Should -BeExactly '0.0.2'
+        }
+
+        It 'no record is today''s daily and records the installed version' {
+            # a machine that ran setup before S-6: no pass forced today, the baseline written so the next release is
+            Set-InstalledPlugins '0.0.2'
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            Get-Argv (Get-Sessions)[0] | Should -BeExactly ($script:DailyArgv -join ' ') -Because 'no pass forced'
+            (Get-Said $r).Count | Should -Be 0
+            Get-Record | Should -BeExactly '0.0.2' -Because 'recorded after the clean exit'
+            Get-State | Should -BeNullOrEmpty -Because 'the state file is not the launcher''s to write'
+        }
+
+        It 'an unknown installed version changes nothing' {
+            foreach ($case in @(@{ Shape = 'missing'; Keep = $false }, @{ Shape = 'malformed'; Keep = $false }, @{ Shape = 'missing'; Keep = $true })) {
+                Reset-Fake
+                Remove-Item -LiteralPath (Join-Path $script:T.Home '.fuse') -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath (Join-Path $script:T.Home '.claude') -Recurse -Force -ErrorAction SilentlyContinue
+                if ($case.Shape -eq 'malformed') { Set-MalformedInstalledPlugins }
+                if ($case.Keep) { Set-Record '0.0.1' }
+                $why = 'shape=' + $case.Shape + ' record=' + $case.Keep
+                $r = Invoke-Launcher
+                $r.Code | Should -Be 0 -Because ($why + ': ' + $r.Err)
+                Get-Argv (Get-Sessions)[0] | Should -BeExactly ($script:DailyArgv -join ' ') -Because $why
+                (Get-Said $r).Count | Should -Be 0 -Because $why
+                if ($case.Keep) { Get-Record | Should -BeExactly '0.0.1' -Because $why } else { Get-Record | Should -BeNullOrEmpty -Because $why }
+            }
+        }
+
+        It 'a non-zero exit records nothing' {
+            Set-InstalledPlugins '0.0.2'
+            Set-Record '0.0.1'
+            Set-Env 'FAKE_CLAUDE_EXIT' '3'
+            Set-Env 'FAKE_CLAUDE_STDERR' 'Error: something else broke'
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 3 -Because 'claude''s own code'
+            Get-Argv (Get-Sessions)[0] | Should -BeExactly (($script:DailyArgv + @($script:KeepCurrentPrompt)) -join ' ')
+            Get-Record | Should -BeExactly '0.0.1' -Because 'the pass did not complete: the next launch runs it again'
+        }
+
+        It 'update runs the same check after the two update lines' {
+            Set-InstalledPlugins '0.0.2'
+            Set-Record '0.0.1'
+            $r = Invoke-Launcher 'update'
+            $r.Code | Should -Be 0 -Because $r.Err
+            (@((Get-Launches) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly (@('plugin marketplace update fuse-internal', 'plugin update deployment-manager@fuse-internal', (($script:DailyArgv + @($script:KeepCurrentPrompt)) -join ' ')) -join '|')
+            Get-Record | Should -BeExactly '0.0.2'
+            (Get-Said $r).Count | Should -Be 1
+            foreach ($bad in @('--dangerously-skip-permissions', 'bypassPermissions', '--plugin-url')) { Get-Argv (Get-Launches)[-1] | Should -Not -BeLike ('*' + $bad + '*') }
+        }
+
+        It 'setup records the version when the loop ends done' {
+            Set-InstalledPlugins '0.0.2'
+            Set-Env 'FAKE_PLUGIN_LIST' $script:PluginListPresent
+            Set-Env 'FAKE_CLAUDE_WRITE_STATE' 'done'
+            $r = Invoke-Launcher 'setup'
+            $r.Code | Should -Be 0 -Because $r.Err
+            Get-Record | Should -BeExactly '0.0.2'
+            Get-State | Should -BeExactly 'done' -Because 'the state word is setup''s, untouched'
+        }
+
+        It 'help and the header say what the daily verb does now' {
+            $r = Invoke-Launcher '-Help'
+            $r.Code | Should -Be 0 -Because $r.Err
+            $r.Out | Should -BeLike '*keep-current*'
+            $r.Out | Should -BeLike '*~/.fuse/dm-setup/plugin-version*'
+            (Get-Text).Split('param(')[0] | Should -BeLike '*keep-current*' -Because 'the header comment says it'
         }
     }
 

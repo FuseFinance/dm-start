@@ -5,7 +5,13 @@
 # `claude plugin list` (the bootstrap plugin's part one, or setup's part two), starts the session with the setup flags,
 # and after each exit reads ~/.fuse/dm-setup/state to decide whether another pass follows — at most three launches.
 # A bare `fuse-dm` is the daily session: Fable, auto mode, ~/Fuse, no bypass flag, ever. `fuse-dm update` runs the
-# plugin update ritual, then the daily session. `fuse-dm install-shim` is setup's row 14: the shim at ~/.fuse/bin/fuse-dm
+# plugin update ritual, then the daily session. Both keep the machine current (OPX-1366, S-6): the launcher records
+# the deployment-manager version it last ran a pass for in ~/.fuse/dm-setup/plugin-version (its own file — setup
+# rewrites `state` whole) and reads the installed one from installed_plugins.json (awk, no claude process); moved →
+# the daily session opens on setup's keep-current pass, the prompt "/deployment-manager:setup keep-current" as the
+# last token of the same daily argv, one line said first, and the record is rewritten after a clean exit; equal →
+# nothing; no record → today's daily and the version recorded after a clean exit; unknown → nothing.
+# `fuse-dm install-shim` is setup's row 14: the shim at ~/.fuse/bin/fuse-dm
 # (which execs the installed plugin's copy of this file, so a plugin update needs no re-install) and the Desktop icon.
 # The same file is published as dm.sh in FuseFinance/dm-start (OPX-1332): the one line `curl -fsSL …/dm.sh | bash`
 # reaches it with no argv and an EMPTY BASH_SOURCE — bash read it from stdin, not from a file — and that case is setup,
@@ -29,6 +35,9 @@ BOOTSTRAP_URL="${FUSE_DM_BOOTSTRAP_URL:-https://github.com/FuseFinance/dm-start/
 OS="${FUSE_DM_OSTYPE:-${OSTYPE:-}}"
 ROOT_DIR="$HOME/Fuse"
 STATE_FILE="$HOME/.fuse/dm-setup/state"      # read only: the bootstrap plugin and setup write it
+VERSION_FILE="$HOME/.fuse/dm-setup/plugin-version"   # the launcher's own: the plugin version it last ran a pass for
+INSTALLED_PLUGINS="$HOME/.claude/plugins/installed_plugins.json"
+KEEP_CURRENT_PROMPT="/deployment-manager:setup keep-current"
 SHIM="$HOME/.fuse/bin/fuse-dm"
 RETRY_MODEL="opus"
 
@@ -37,9 +46,12 @@ help() {
     '  setup         install or finish the Fuse environment: part one (the bootstrap plugin) when deployment-manager is' \
     '                not installed, part two (/deployment-manager:setup) when it is; another pass follows when' \
     '                ~/.fuse/dm-setup/state says so (bootstrap-done, needs-second-pass); at most three launches' \
-    '  (none)        the daily session: claude on Fable, auto mode, in ~/Fuse — prompts on, no bypass' \
+    '  (none)        the daily session: claude on Fable, auto mode, in ~/Fuse — prompts on, no bypass; when the installed' \
+    '                deployment-manager version differs from ~/.fuse/dm-setup/plugin-version (the one the last pass ran' \
+    '                for), the session opens on /deployment-manager:setup keep-current — every row re-checked, seconds —' \
+    '                and the record is rewritten after a clean exit; no record yet → the daily session, the version recorded' \
     '  update        claude plugin marketplace update fuse-internal, claude plugin update deployment-manager@fuse-internal,' \
-    '                then the daily session' \
+    '                then the daily session, with the same keep-current check' \
     '  install-shim  write ~/.fuse/bin/fuse-dm (execs the installed plugin'"'"'s bin/fuse-dm, installPath read from' \
     '                installed_plugins.json on every call) and the Desktop icon Fuse Claude.command / Fuse Claude.cmd' \
     '' \
@@ -84,6 +96,32 @@ read_state() {
   STATE="${STATE:-}"
 }
 
+# ---- keep current (OPX-1366): the installed deployment-manager version, from installed_plugins.json with the shim's
+# awk idiom on "version" (the entry's own key; the file's top-level "version" is an integer and never matches) — no
+# claude process, so the daily verb still launches once. INSTALLED empty = unknown = nothing. RECORD is what
+# ~/.fuse/dm-setup/plugin-version holds, the launcher's own file: setup rewrites `state` whole, so this is not a second
+# line of it. Different → KEEP_CURRENT=1 and one line said; the record is written only after a clean exit. ----
+INSTALLED=""; RECORD=""; KEEP_CURRENT=0
+installed_version() {
+  INSTALLED="$(awk '/"deployment-manager@fuse-internal"/{f=1} f&&/"version"[[:space:]]*:[[:space:]]*"/{sub(/.*"version"[[:space:]]*:[[:space:]]*"/,""); sub(/".*/,""); print; exit}' "$INSTALLED_PLUGINS" 2>/dev/null)"
+}
+keep_current_check() {
+  KEEP_CURRENT=0; RECORD=""
+  installed_version
+  [ -n "$INSTALLED" ] || return 0
+  [ -f "$VERSION_FILE" ] && read -r RECORD < "$VERSION_FILE" 2>/dev/null
+  RECORD="${RECORD:-}"
+  if [ -n "$RECORD" ] && [ "$RECORD" != "$INSTALLED" ]; then
+    KEEP_CURRENT=1
+    say "the plugin moved to $INSTALLED — re-checking the environment first, seconds"
+  fi
+}
+record_version() {   # after a clean exit only; nothing to write when the version is unknown or already recorded
+  [ -n "$INSTALLED" ] && [ "$RECORD" != "$INSTALLED" ] || return 0
+  { mkdir -p "${VERSION_FILE%/*}" && printf '%s\n' "$INSTALLED" > "$VERSION_FILE"; } 2>/dev/null \
+    || say "could not record the plugin version at $VERSION_FILE — the next launch re-checks the environment again"
+}
+
 # ---- one session: claude in ~/Fuse, the argv rebuilt from the current MODEL; stderr tee'd through a file so a model
 # refusal (non-zero, and stderr names the model) can be told from any other exit. Sets RC. A refusal retries once with
 # opus and keeps it for the passes that follow; anything else propagates as claude's own code. The setup session alone
@@ -97,6 +135,8 @@ launch() {
     else
       set -- --model "$MODEL" --effort "$EFFORT" --dangerously-skip-permissions "/deployment-manager:setup"
     fi
+  elif [ "$KEEP_CURRENT" = 1 ]; then
+    set -- --model "$MODEL" --permission-mode auto "$KEEP_CURRENT_PROMPT"
   else
     set -- --model "$MODEL" --permission-mode auto
   fi
@@ -138,6 +178,7 @@ do_setup() {
     esac
   done
   if [ "$STATE" = done ]; then
+    installed_version; RECORD=""; record_version     # read after the passes: part one is what installs the plugin
     say "setup finished — from now on double-click Fuse Claude on your Desktop, or type fuse-dm"
   else
     say "setup closed (state: ${STATE:-none}) — run fuse-dm setup again to finish; day to day, double-click Fuse Claude on your Desktop, or type fuse-dm"
@@ -145,17 +186,21 @@ do_setup() {
   exit 0
 }
 
-# ---- daily, and update-then-daily ----
+# ---- daily, and update-then-daily: the keep-current check before the launch, the record after a clean exit ----
 do_daily() {
   need_claude
+  keep_current_check
   launch daily
+  [ "$RC" -eq 0 ] && record_version
   exit "$RC"
 }
 do_update() {
   need_claude
   "$CLAUDE" plugin marketplace update fuse-internal && "$CLAUDE" plugin update deployment-manager@fuse-internal \
     || say "the plugin update did not go through — the session opens on the copy you have; run fuse-dm update again later"
+  keep_current_check
   launch daily
+  [ "$RC" -eq 0 ] && record_version
   exit "$RC"
 }
 
