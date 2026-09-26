@@ -32,13 +32,24 @@ From then on, `fuse-dm` typed in a terminal (or the **Fuse Claude** icon on the 
 | --- | --- |
 | `dm.sh` | the launcher (bash 3.2 and Git Bash) |
 | `dm.ps1` | the same launcher for a Windows machine before Git for Windows (Windows PowerShell 5.1 and 7) |
-| `fuse-start/` | the bootstrap plugin: one skill, `/fuse-start:begin` |
+| `people-ops.sh` | the People Ops one line (bash 3.2): Claude Code when missing, then one session on `/fuse-start:people-ops` |
+| `fuse-start/` | the bootstrap plugin: `/fuse-start:begin` for deployment managers, `/fuse-start:people-ops` for People Ops |
 | `tests/test_launcher.py` | the launcher's behaviour tests, run by CI against `dm.sh` with a fake `claude`; its `Parity` class pins `dm.ps1` to `dm.sh` |
 | `tests/fuse-dm.Tests.ps1` | the Pester suite for `dm.ps1`, run by CI on `windows-latest` under Windows PowerShell 5.1 and pwsh with a fake `claude` and a fake `winget` |
 | `scripts/testlib/` | the fake-executable helper those tests import (`fake_exec.py`, stdlib only: hard links to one assessed shim, so macOS never re-assesses a fresh stub) |
 | `dist/fuse-start.zip` | the release asset the launcher fetches (one top folder, `fuse-start/`) |
 
 Nothing here holds a secret, a client name or a credential: the plugin's only internal URL is the private plugin repository's. Everything client-specific lives in the private plugin, which needs the GitHub access part one proves.
+
+## People Ops
+
+The one line a Fuse People Ops teammate pastes into Terminal on a new Mac, once:
+
+```
+curl -fsSL https://raw.githubusercontent.com/FuseFinance/dm-start/main/people-ops.sh | bash
+```
+
+`people-ops.sh` installs Claude Code when the Mac has none, then opens one Claude session with this repository's `fuse-start` plugin loaded for that session only, running `/fuse-start:people-ops`: git, the GitHub CLI and Node without an administrator password, one GitHub sign-in in the browser, the access check to `https://github.com/FuseFinance/internal-skills`, and the `people-ops` plugin from the private marketplace. Then the person types `/exit`, opens the Claude app (downloading it from claude.ai/download first if it isn't on their Mac yet, and signing in), chooses **Code**, starts a new session in the folder Fuse → studio in their home folder, and types `/people-ops:studio-setup`.
 
 ## Publishing
 
