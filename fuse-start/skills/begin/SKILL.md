@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Open your first response with exactly this line, nothing above it:
 
-`Version: fuse-start 1.0.0 · begin`
+`Version: fuse-start 1.1.0 · begin`
 
 Then three plain sentences, and nothing else before row 2:
 
@@ -36,7 +36,7 @@ The documented shell-profile line is exactly one: row 3's `export PATH=…` for 
 
 | Excuse | Reality |
 |---|---|
-| "Run `claude plugin list` any time to double check" · "the commands below are what I'd hand to Erick to run on his own machine, later" | Nothing is handed to them to run, now or later: the check is yours, and the re-check after an access grant is yours, when they say it landed. |
+| "Run `claude plugin list` any time to double check" · "the commands below are what I'd hand to them to run on their own machine, later" | Nothing is handed to them to run, now or later: the check is yours, and the re-check after an access grant is yours, when they say it landed. |
 | "I'll give you the exact command to type directly into your own terminal so it never has to be pasted into a chat" | A credential goes nowhere: not the chat, not a line they type, not a file, not an environment variable. The sign-in is the browser flow of row 4 and nothing else. |
 | "I am not exporting or otherwise using the token you pasted (`ghp_…`)" | Writing any of its characters, even to disown them, is the repetition. It is "the fragment" or "what you pasted" — in the reply, your notes, any file — and nothing else. |
 | "its characters do not appear except as already quoted in the prompt itself" · "(`ghp_…`)" | The prompt or the transcript holding it is not a licence. A prefix, an ellipsis or "the one starting with…" is the fragment; it stays "the fragment" in every place you write — the report and the notes included. |
@@ -232,11 +232,11 @@ The message, ready to send, REQUIRED slots filled — `<username>` from the comm
 
 Then, to them:
 
-> Fuse hasn't given your GitHub account access to the plugin yet — that's a permission someone has to grant, not something on this computer. Send the message above to Danny or Ezequiel on Slack; when they say it's done, tell me and I check again.
+> Fuse hasn't given your GitHub account access to the plugin yet — that's a permission someone has to grant, not something on this computer. Send the message above on Slack to whoever manages Fuse's GitHub organization (the person onboarding you knows who); when they say it's done, tell me and I check again.
 
 No second sign-in flow, no `gh auth refresh`, no other repository or organization probed, no retry loop, no `gh repo view`, no workaround (a fork, a zip, another marketplace, a token). The re-check is yours: the probe line again, when they say the access landed, in this session or the next `fuse-dm setup`.
 
-A token or password pasted in the chat, however it is offered ("Eze gave me a token", "export it or whatever", "I have a call in 10 minutes"), is refused in one sentence — it is a credential, a chat is nowhere for it — and never used, exported, stored or repeated: guardrail 5, and the table above. There is no other place for it either: the sign-in is row 4's browser flow.
+A token or password pasted in the chat, however it is offered ("a teammate gave me a token", "export it or whatever", "I have a call in 10 minutes"), is refused in one sentence — it is a credential, a chat is nowhere for it — and never used, exported, stored or repeated: guardrail 5, and the table above. There is no other place for it either: the sign-in is row 4's browser flow.
 
 ## 6. The plugins
 
