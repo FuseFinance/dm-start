@@ -24,7 +24,7 @@ irm https://raw.githubusercontent.com/FuseFinance/dm-start/main/dm.ps1 | iex
 
 `dm.ps1` is the same launcher for Windows PowerShell (5.1 and 7), read through `iex` with no arguments. Before it does anything `dm.sh` does, it installs Git for Windows when there is none (`winget install -e --id Git.Git`) and sets `CLAUDE_CODE_GIT_BASH_PATH` to `C:\Program Files\Git\bin\bash.exe` in the same PowerShell — no new window, no PATH refresh — so Claude Code opens with a Bash tool from its first session. Then it matches `dm.sh` step for step: Claude Code when missing, the three things, part one, part two, the same state file. `install-shim` stays with `dm.sh`, which the Desktop icon runs under Git Bash.
 
-From then on, `fuse-dm` typed in a terminal (or the **Fuse Claude** icon on the Desktop) is the day's session. `dm.sh` is `bin/fuse-dm` and `dm.ps1` is `bin/fuse-dm.ps1` from the private plugin, copied here byte for byte at each publish.
+From then on, `fuse-dm` typed in a terminal (or the **Fuse Claude** icon on the Desktop) is the day's session: it checks the plugin is current, then opens T3 Code once setup has set it up, or the terminal session when it has not; `fuse-dm term` is always the terminal session. `dm.sh` is `bin/fuse-dm` and `dm.ps1` is `bin/fuse-dm.ps1` from the private plugin, copied here byte for byte at each publish.
 
 ## What is in this repository
 

@@ -167,7 +167,8 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
         $script:EnvKeys = @('HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'TMPDIR', 'TEMP', 'TMP', 'PATH', 'FAKE_DIR', 'FAKE_STUB',
             'FAKE_PLUGIN_LIST', 'FAKE_CLAUDE_WRITE_STATE', 'FAKE_CLAUDE_EXIT', 'FAKE_CLAUDE_STDERR', 'FAKE_UPDATE_RC',
             'FUSE_DM_MODEL', 'FUSE_DM_EFFORT', 'FUSE_DM_BOOTSTRAP_URL', 'FUSE_DM_INSTALLER', 'FUSE_DM_GIT_BASH',
-            'FUSE_DM_LAUNCHER', 'CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_GIT_BASH_PATH')
+            'FUSE_DM_LAUNCHER', 'CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_GIT_BASH_PATH',
+            'FUSE_DM_SURFACE', 'FUSE_DM_T3_APP', 'FUSE_DM_OPENER', 'FAKE_OPENER_EXIT', 'T3CODE_TELEMETRY_ENABLED', 'LOCALAPPDATA')   # OPX-1890
         $script:PluginListAbsent = "Installed plugins:`n`n  > slack@claude-plugins-official`n    Version: 1.0.0`n    Scope: user`n    Status: enabled`n"
         $script:PluginListPresent = $script:PluginListAbsent + "`n  > deployment-manager@fuse-internal`n    Version: 0.0.0`n    Scope: user`n    Status: enabled`n"
         $script:BootstrapUrl = 'https://github.com/FuseFinance/dm-start/releases/latest/download/fuse-start.zip'
@@ -351,7 +352,8 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
         Set-Env 'FUSE_DM_INSTALLER' (Get-Installer $script:InstallerNoop)   # never the real installer from a test
         Set-Env 'FUSE_DM_GIT_BASH' $script:T.GitBash
         foreach ($k in @('FAKE_CLAUDE_WRITE_STATE', 'FAKE_CLAUDE_EXIT', 'FAKE_CLAUDE_STDERR', 'FAKE_UPDATE_RC', 'FUSE_DM_MODEL', 'FUSE_DM_EFFORT',
-                'FUSE_DM_BOOTSTRAP_URL', 'FUSE_DM_LAUNCHER', 'CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_GIT_BASH_PATH')) { Set-Env $k $null }
+                'FUSE_DM_BOOTSTRAP_URL', 'FUSE_DM_LAUNCHER', 'CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_GIT_BASH_PATH',
+                'FUSE_DM_SURFACE', 'FUSE_DM_T3_APP', 'FUSE_DM_OPENER', 'FAKE_OPENER_EXIT', 'T3CODE_TELEMETRY_ENABLED')) { Set-Env $k $null }
     }
 
     AfterEach {
@@ -869,6 +871,308 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
         }
     }
 
+    Describe 'T3Surface' {
+        # OPX-1890 (docs/spec/2026-10-02-fuse-dm-t3-icon-design.md, ruling J): bare fuse-dm.ps1 and `update` open T3 Code
+        # when setup's row 15 configured it - ~/.fuse/dm-setup/t3-ready AND the app found (FUSE_DM_T3_APP when set, else the
+        # first T3 Code*.exe in $env:LOCALAPPDATA\Programs\t3code) - after the keep-current check: unchanged -> no
+        # claude process at all, the opener; moved -> a headless keep-current pass (the daily argv, -p right before the
+        # prompt), the record, then the opener; a failed pass -> today's console session on the prompt. `term` and
+        # FUSE_DM_SURFACE=term are today's session. The opener is FUSE_DM_OPENER, a fake that records its argv, the
+        # T3CODE_TELEMETRY_ENABLED it saw, the claude calls before it and the record at that moment; Windows closes no
+        # window. Each console case first proves its fixture opens T3 Code (the control), then flips one condition.
+        # Mirrors test_launcher.py's T3Surface.
+
+        BeforeAll {
+            $openerFake = Join-Path $script:Stub 'opener-fake.ps1'
+            Write-Ascii $openerFake @'
+# opener-fake.ps1 (OPX-1890): the fake opener behind FUSE_DM_OPENER. The first argument is the wrapper's own path; the
+# rest is the opener's argv. Records it as $FAKE_DIR/opener.<n> with the T3CODE_TELEMETRY_ENABLED it saw, the claude
+# invocations counted before it and the version record at that moment; exits FAKE_OPENER_EXIT (0 when unset).
+$fakeDir = $env:FAKE_DIR
+$countFile = Join-Path $fakeDir 'opener-count'
+$n = 1
+if (Test-Path -LiteralPath $countFile) { $n = [int]([IO.File]::ReadAllText($countFile).Trim()) + 1 }
+[IO.File]::WriteAllText($countFile, [string]$n)
+$lines = @()
+if ($args.Count -gt 1) { foreach ($a in $args[1..($args.Count - 1)]) { $lines += ('arg=' + [string]$a) } }
+$t = $env:T3CODE_TELEMETRY_ENABLED
+if (-not $t) { $t = 'unset' }
+$lines += ('telemetry=' + $t)
+$c = 0
+$claudeCount = Join-Path $fakeDir 'count'
+if (Test-Path -LiteralPath $claudeCount) { $c = [int]([IO.File]::ReadAllText($claudeCount).Trim()) }
+$lines += ('claude_calls=' + $c)
+$homeDir = $env:USERPROFILE
+if (-not $homeDir) { $homeDir = $env:HOME }
+$recordFile = [IO.Path]::Combine($homeDir, '.fuse', 'dm-setup', 'plugin-version')
+$v = 'none'
+if (Test-Path -LiteralPath $recordFile) { $v = [IO.File]::ReadAllText($recordFile).Trim() }
+$lines += ('record=' + $v)
+[IO.File]::WriteAllLines((Join-Path $fakeDir ('opener.' + $n)), [string[]]$lines)
+$rc = 0
+if ($env:FAKE_OPENER_EXIT) { $rc = [int]$env:FAKE_OPENER_EXIT }
+exit $rc
+'@
+            $script:OpenerWrapper = Write-Wrapper 'opener' $openerFake
+            $script:MovedT3 = ' - re-checking the environment first, then T3 Code opens by itself (threads already open there keep the old version until you start a new one)'
+            $script:MovedTerm = ' - re-checking the environment first, seconds'
+            $script:NoApp = 'fuse-dm: T3 Code is not where setup put it - the terminal session instead; fuse-dm setup puts it back'
+            $script:Opening = 'fuse-dm: opening T3 Code'
+            $script:UpdateLines = @('plugin marketplace update fuse-internal', 'plugin update deployment-manager@fuse-internal')
+            $script:HeadlessArgv = (($script:DailyArgv + @('-p', $script:KeepCurrentPrompt)) -join ' ')
+            $script:PassArgv = (($script:DailyArgv + @($script:KeepCurrentPrompt)) -join ' ')
+
+            function Set-T3Ready {
+                # a machine row 15 finished on: the app (a temp .exe, through FUSE_DM_T3_APP), the marker, the installed
+                # version and the record; the opener seam pointed at the fake
+                param([switch]$NoApp, [switch]$NoMarker, [string]$Record = '0.0.2')
+                $exe = [IO.Path]::Combine($script:T.Tmp, 'T3 Code (Alpha)', 'T3 Code (Alpha).exe')
+                if (-not $NoApp) {
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $exe) -Force | Out-Null
+                    [IO.File]::WriteAllText($exe, '')
+                }
+                if (-not $NoMarker) {
+                    $dir = [IO.Path]::Combine($script:T.Home, '.fuse', 'dm-setup')
+                    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+                    [IO.File]::WriteAllText((Join-Path $dir 't3-ready'), "2026-10-08T18:20:00Z`n")
+                }
+                Set-InstalledPlugins '0.0.2'
+                if ($Record) { Set-Record $Record }
+                Set-Env 'FUSE_DM_T3_APP' $exe
+                Set-Env 'FUSE_DM_OPENER' $script:OpenerWrapper
+                return $exe
+            }
+            function Get-Openers {
+                # every opener call, in order: @{ Args; Telemetry; ClaudeCalls; Record }
+                $records = @()
+                $files = Get-ChildItem -LiteralPath $script:T.Fake -Filter 'opener.*' -ErrorAction SilentlyContinue | Sort-Object { [int]($_.Name.Split('.')[1]) }
+                foreach ($f in $files) {
+                    $rec = @{ Args = @() }
+                    foreach ($line in [IO.File]::ReadAllLines($f.FullName)) {
+                        $i = $line.IndexOf('=')
+                        $k = $line.Substring(0, $i); $v = $line.Substring($i + 1)
+                        switch ($k) {
+                            'arg' { $rec.Args += $v }
+                            'telemetry' { $rec.Telemetry = $v }
+                            'claude_calls' { $rec.ClaudeCalls = $v }
+                            'record' { $rec.Record = $v }
+                        }
+                    }
+                    $records += $rec
+                }
+                return ,$records
+            }
+            function Get-OutLines($R) { return ,@($R.Out -split "`r?`n") }
+            function Get-LineCount($R, [string]$Line) { return @((Get-OutLines $R) | Where-Object { $_ -eq $Line }).Count }
+            function Get-Marker { return [IO.Path]::Combine($script:T.Home, '.fuse', 'dm-setup', 't3-ready') }
+        }
+
+        It 'ready and unchanged: the opener, and no claude process at all (AC1, AC8)' {
+            $exe = Set-T3Ready
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            (Get-Launches).Count | Should -Be 0 -Because 'no claude process on an unchanged version'
+            $o = Get-Openers
+            $o.Count | Should -Be 1 -Because ($r.Out + $r.Err)
+            (@($o[0].Args) -join '|') | Should -BeExactly $exe
+            $o[0].Telemetry | Should -BeExactly 'false' -Because 'T3CODE_TELEMETRY_ENABLED=false in this process around the opener'
+            Get-LineCount $r $script:Opening | Should -Be 1
+            (Get-Said $r).Count | Should -Be 0
+            Get-Record | Should -BeExactly '0.0.2'
+        }
+
+        It 'moved: a headless -p keep-current pass, the record, then the opener (AC3)' {
+            Set-T3Ready -Record '0.0.1' | Out-Null
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            $s = Get-Sessions
+            $s.Count | Should -Be 1 -Because ($r.Out + $r.Err)
+            Get-Argv $s[0] | Should -BeExactly $script:HeadlessArgv -Because 'the daily argv, -p right before the prompt, the prompt last'
+            Get-Record | Should -BeExactly '0.0.2'
+            $o = Get-Openers
+            $o.Count | Should -Be 1
+            $o[0].ClaudeCalls | Should -BeExactly '1' -Because 'the opener runs after the pass'
+            $o[0].Record | Should -BeExactly '0.0.2' -Because 'and after the record'
+            Get-LineCount $r ('fuse-dm: the plugin moved to 0.0.2' + $script:MovedT3) | Should -Be 1 -Because $r.Out
+            $r.Out | Should -Not -BeLike ('*' + $script:MovedTerm + '*')
+        }
+
+        It 'a failed pass: no T3 Code, the console session on the prompt, its code (ruling G)' {
+            foreach ($case in @(@{ Exits = '3,0'; Code = 0; Record = '0.0.2' }, @{ Exits = '3,5'; Code = 5; Record = '0.0.1' })) {
+                Reset-Fake
+                Set-T3Ready -Record '0.0.1' | Out-Null
+                Set-Env 'FAKE_CLAUDE_EXIT' $case.Exits
+                $r = Invoke-Launcher
+                $why = 'FAKE_CLAUDE_EXIT=' + $case.Exits
+                $r.Code | Should -Be $case.Code -Because ($why + ': ' + $r.Err)
+                (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:HeadlessArgv + '|' + $script:PassArgv) -Because $why
+                Get-LineCount $r 'fuse-dm: the re-check stopped (exit 3) - opening it in the terminal instead' | Should -Be 1 -Because $why
+                (Get-Openers).Count | Should -Be 0 -Because $why
+                Get-Record | Should -BeExactly $case.Record -Because $why
+            }
+        }
+
+        It 'a refused model on the pass: the one opus retry keeps -p (Review Focus 4)' {
+            Set-T3Ready -Record '0.0.1' | Out-Null
+            Set-Env 'FAKE_CLAUDE_EXIT' '1,0'
+            Set-Env 'FAKE_CLAUDE_STDERR' $script:Refusal
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:HeadlessArgv + '|' + ('--model opus --permission-mode auto -p ' + $script:KeepCurrentPrompt))
+            Get-Record | Should -BeExactly '0.0.2'
+            (Get-Openers).Count | Should -Be 1
+        }
+
+        It 'the app without the marker is the console session (AC4)' {
+            Set-T3Ready | Out-Null
+            Invoke-Launcher | Out-Null
+            (Get-Openers).Count | Should -Be 1 -Because 'the control: this machine opens T3 Code'
+            Remove-Item -LiteralPath (Get-Marker) -Force
+            Reset-Fake
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:DailyArgv -join ' ')
+            (Get-Openers).Count | Should -Be 0
+            $r.Out | Should -Not -BeLike '*T3 Code*' -Because 'setup has not set it up: nothing to say about it'
+        }
+
+        It 'the marker without the app: one line, then the console session (AC5)' {
+            $exe = Set-T3Ready
+            Invoke-Launcher | Out-Null
+            (Get-Openers).Count | Should -Be 1 -Because 'the control: this machine opens T3 Code'
+            Remove-Item -LiteralPath $exe -Force
+            Reset-Fake
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            Get-LineCount $r $script:NoApp | Should -Be 1 -Because ($r.Out + $r.Err)
+            (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:DailyArgv -join ' ')
+            (Get-Openers).Count | Should -Be 0
+            Test-Path -LiteralPath (Get-Marker) | Should -BeTrue -Because 'the marker is setup''s: never removed by the launcher'
+        }
+
+        It 'term is today''s session, ready or not (AC6)' {
+            Set-T3Ready | Out-Null
+            $r = Invoke-Launcher 'term'
+            $r.Code | Should -Be 0 -Because $r.Err
+            (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:DailyArgv -join ' ')
+            (Get-Openers).Count | Should -Be 0
+            Reset-Fake
+            Set-Record '0.0.1'
+            $r = Invoke-Launcher 'term'
+            $r.Code | Should -Be 0 -Because $r.Err
+            (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly $script:PassArgv -Because 'the keep-current pass in the console: no -p'
+            Get-LineCount $r ('fuse-dm: the plugin moved to 0.0.2' + $script:MovedTerm) | Should -Be 1 -Because $r.Out
+            Get-Record | Should -BeExactly '0.0.2'
+            (Get-Openers).Count | Should -Be 0
+        }
+
+        It 'update: the two lines, then the hand-over (AC7)' {
+            Set-T3Ready | Out-Null
+            $r = Invoke-Launcher 'update'
+            $r.Code | Should -Be 0 -Because $r.Err
+            (@((Get-Launches) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:UpdateLines -join '|') -Because 'no session on an unchanged version'
+            $o = Get-Openers
+            $o.Count | Should -Be 1
+            $o[0].ClaudeCalls | Should -BeExactly '2' -Because 'after the two update lines'
+            Reset-Fake
+            Set-Record '0.0.1'
+            $r = Invoke-Launcher 'update'
+            $r.Code | Should -Be 0 -Because $r.Err
+            (@((Get-Launches) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly (($script:UpdateLines + @($script:HeadlessArgv)) -join '|')
+            Get-Record | Should -BeExactly '0.0.2'
+            (Get-Openers).Count | Should -Be 1
+        }
+
+        It 'FUSE_DM_SURFACE=term keeps the console session, bare and update (AC9)' {
+            Set-T3Ready | Out-Null
+            Set-Env 'FUSE_DM_SURFACE' 'auto'
+            Invoke-Launcher | Out-Null
+            (Get-Openers).Count | Should -Be 1 -Because 'any value but term: the surface rule'
+            Reset-Fake
+            Set-Env 'FUSE_DM_SURFACE' 'term'
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:DailyArgv -join ' ')
+            (Get-Openers).Count | Should -Be 0
+            Reset-Fake
+            $r = Invoke-Launcher 'update'
+            $r.Code | Should -Be 0 -Because $r.Err
+            (@((Get-Launches) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly (($script:UpdateLines + @($script:DailyArgv -join ' ')) -join '|')
+            (Get-Openers).Count | Should -Be 0
+        }
+
+        It 'an opener that fails: one line, then the console session (ruling F)' {
+            Set-T3Ready | Out-Null
+            Set-Env 'FAKE_OPENER_EXIT' '1'
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            (Get-Openers).Count | Should -Be 1 -Because 'the opener was tried'
+            Get-LineCount $r 'fuse-dm: T3 Code did not open (exit 1) - the terminal session instead' | Should -Be 1 -Because ($r.Out + $r.Err)
+            Get-LineCount $r $script:Opening | Should -Be 0
+            (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:DailyArgv -join ' ')
+        }
+
+        It 'no record yet: the version recorded, then the opener (ruling I)' {
+            Set-T3Ready -Record '' | Out-Null
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            (Get-Launches).Count | Should -Be 0 -Because 'no pass forced'
+            Get-Record | Should -BeExactly '0.0.2'
+            (@((Get-Openers) | ForEach-Object { $_.Record }) -join '|') | Should -BeExactly '0.0.2' -Because 'recorded before the opener runs'
+        }
+
+        It 'the app found as LOCALAPPDATA\Programs\t3code\T3 Code*.exe when FUSE_DM_T3_APP is unset (ruling E)' {
+            # Axel's Windows status (10-05): winget's per-user install is %LOCALAPPDATA%\Programs\t3code\, its
+            # uninstaller beside the app; a `T3 Code*` folder under Programs is not where it lands
+            Set-T3Ready -NoApp | Out-Null
+            Set-Env 'FUSE_DM_T3_APP' $null
+            $local = Join-Path $script:T.Tmp 'localappdata'
+            $exe = [IO.Path]::Combine($local, 'Programs', 't3code', 'T3 Code (Alpha).exe')
+            New-Item -ItemType Directory -Path (Split-Path -Parent $exe) -Force | Out-Null
+            [IO.File]::WriteAllText($exe, '')
+            [IO.File]::WriteAllText([IO.Path]::Combine($local, 'Programs', 't3code', 'Uninstall T3 Code (Alpha).exe'), '')
+            Set-Env 'LOCALAPPDATA' $local
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            (@((Get-Openers) | ForEach-Object { @($_.Args) -join '|' }) -join '#') | Should -BeExactly $exe
+            (Get-Sessions).Count | Should -Be 0
+        }
+
+        It 'a T3 Code* folder under LOCALAPPDATA\Programs is not the app: the NO_APP line, then the console session (ruling E)' {
+            Set-T3Ready -NoApp | Out-Null
+            Set-Env 'FUSE_DM_T3_APP' $null
+            $local = Join-Path $script:T.Tmp 'localappdata'
+            $guess = [IO.Path]::Combine($local, 'Programs', 'T3 Code (Alpha)', 'T3 Code (Alpha).exe')
+            New-Item -ItemType Directory -Path (Split-Path -Parent $guess) -Force | Out-Null
+            [IO.File]::WriteAllText($guess, '')
+            Set-Env 'LOCALAPPDATA' $local
+            $r = Invoke-Launcher
+            $r.Code | Should -Be 0 -Because $r.Err
+            Get-LineCount $r $script:NoApp | Should -Be 1 -Because ($r.Out + $r.Err)
+            (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:DailyArgv -join ' ')
+            (Get-Openers).Count | Should -Be 0
+        }
+
+        It 'help names term, T3 Code and the three seams (AC11)' {
+            $r = Invoke-Launcher '-Help'
+            $r.Code | Should -Be 0 -Because $r.Err
+            (Get-OutLines $r)[0] | Should -BeExactly 'usage: fuse-dm.ps1 [setup | update | term | -Help]'
+            foreach ($token in @('term', 'T3 Code', 'FUSE_DM_SURFACE', 'FUSE_DM_T3_APP', 'FUSE_DM_OPENER')) {
+                $r.Out | Should -BeLike ('*' + $token + '*') -Because $token
+            }
+            (Get-Launches).Count | Should -Be 0
+        }
+
+        It 'the text: the marker in the ps1 spelling, the telemetry variable, and no window close on Windows (AC10)' {
+            $text = Get-Text
+            foreach ($needle in @("[IO.Path]::Combine(`$script:HomeDir, '.fuse', 'dm-setup', 't3-ready')", "'-p'", "'term'",
+                    'FUSE_DM_SURFACE', 'FUSE_DM_T3_APP', 'FUSE_DM_OPENER', "`$env:T3CODE_TELEMETRY_ENABLED = 'false'")) {
+                $text.Contains($needle) | Should -BeTrue -Because $needle
+            }
+            foreach ($bad in @('osascript', '(Alpha)', 'Stop-Process', 'taskkill')) { $text.Contains($bad) | Should -BeFalse -Because $bad }
+        }
+    }
+
     Describe 'GitForWindows' {
         # AC3: Git for Windows before any claude launch - missing -> the windows.md row 2 line, then
         # CLAUDE_CODE_GIT_BASH_PATH set in THIS process (no PATH refresh); present -> nothing; already set -> untouched
@@ -977,10 +1281,13 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
         }
 
         It 'exits only in the file-run tail, guarded by $PSCommandPath' {
+            # OPX-1890: an `exit` statement, not the word inside a message - the T3 Code lines say `(exit N)` in a string;
+            # each line is read with its string literals emptied and its comment cut (test_launcher.py's ps1_code)
             $text = Get-Text
-            ([regex]::Matches($text, 'exit ')).Count | Should -Be 1
-            $line = @($text -split "`r?`n" | Where-Object { $_ -match 'exit ' })[0]
-            $line | Should -BeLike '*$PSCommandPath*'
+            $code = @($text -split "`r?`n" | ForEach-Object { ((($_ -replace "'(?:[^']|'')*'", "''") -replace '"(?:[^"`]|`.)*"', '""').Split('#'))[0] })
+            $exits = @($code | Where-Object { $_ -match '(?<![\w$.-])exit\b' })
+            $exits.Count | Should -Be 1 -Because ($exits -join ' | ')
+            $exits[0] | Should -BeLike '*$PSCommandPath*'
         }
 
         It 'declares the verb and help parameters first, for iex and for the file' {

@@ -2,7 +2,7 @@
 a stub bin that is FIRST and ONLY on PATH (the five coreutils the script needs are linked in beside it, so the suite
 also pins that dependency set), a temp HOME, nothing of the machine's. The fake records every invocation as
 $FAKE_DIR/launch.<n> (argv0, one arg= line per argument, the cwd, the env it saw, and what stdin is — a terminal or
-not, the /dev/tty alias device or not, OPX-1373), answers `plugin list` from
+not, the /dev/tty alias device or not, OPX-1373; /dev/null or not, OPX-1890), answers `plugin list` from
 $FAKE_PLUGIN_LIST, writes the state file when FAKE_CLAUDE_WRITE_STATE tells it to (the nth comma-separated value on the
 nth session launch) and exits with FAKE_CLAUDE_EXIT's nth value, FAKE_CLAUDE_STDERR on stderr — so the relaunch loop,
 the stage choice and the opus retry are all driven from the outside. The real `claude` is never executed.
@@ -73,6 +73,7 @@ printf 'cwd=%s\nlauncher=%s\neffort_env=%s\n' "$(pwd -P)" "${FUSE_DM_LAUNCHER:-u
 # OPX-1373: what stdin is. `-ef` compares device+inode: an fd opened from /dev/tty matches /dev/tty, a dup of the
 # terminal's own fd does not — and the alias device is the one Bun's kqueue refuses.
 printf 'stdin_tty=%s\nstdin_is_dev_tty=%s\n' "$([ -t 0 ] && echo yes || echo no)" "$([ /dev/fd/0 -ef /dev/tty ] && echo yes || echo no)" >> "$rec"
+printf 'stdin_is_dev_null=%s\n' "$([ /dev/fd/0 -ef /dev/null ] && echo yes || echo no)" >> "$rec"
 case "${1:-} ${2:-}" in
   "plugin list") printf '%s\n' "${FAKE_PLUGIN_LIST:-}"; exit 0 ;;
   "plugin marketplace"|"plugin update") exit "${FAKE_UPDATE_RC:-0}" ;;
@@ -100,6 +101,42 @@ FAKE_PLUGIN_COPY = r'''#!/bin/sh
 printf 'copy=%s\n' "$0" > "$FAKE_DIR/exec.txt"
 for a in "$@"; do printf 'arg=%s\n' "$a" >> "$FAKE_DIR/exec.txt"; done
 exit 0
+'''
+# OPX-1890: the icon opens T3 Code. The opener is an absolute path (FUSE_DM_OPENER) in place of `open` (macOS) or `cmd`
+# (Git Bash); `osascript` and `tty` are written into the stub bin by T3Surface alone, so TOOLS stays the five plus bash
+# and every other class runs with neither. Only builtins in all three.
+T3_MARKER = Path(".fuse") / "dm-setup" / "t3-ready"       # setup's row 15 writes it (t3_code.py settings); the launcher only reads it
+T3_APP = Path("Applications") / "T3 Code (Alpha).app"     # under $HOME: the cask's --appdir ~/Applications
+USAGE = "usage: fuse-dm [setup | update | term | install-shim | --help]"
+PS1_USAGE = "usage: fuse-dm.ps1 [setup | update | term | -Help]"
+FAKE_OPENER = r'''#!/bin/sh
+# fake opener (OPX-1890): records its argv, the T3CODE_TELEMETRY_ENABLED it saw, how many claude invocations came before
+# it and the version record at that moment, as $FAKE_DIR/opener.<n>; writes FAKE_OPENER_STDERR to stderr when set (what
+# macOS `open` says about an already-running app); exits FAKE_OPENER_EXIT (0 when unset).
+n=0; [ -f "$FAKE_DIR/opener-count" ] && read -r n < "$FAKE_DIR/opener-count"; n=$((n+1)); echo "$n" > "$FAKE_DIR/opener-count"
+rec="$FAKE_DIR/opener.$n"
+: > "$rec"
+for a in "$@"; do printf 'arg=%s\n' "$a" >> "$rec"; done
+c=0; [ -f "$FAKE_DIR/count" ] && read -r c < "$FAKE_DIR/count"
+v=none; [ -f "$HOME/.fuse/dm-setup/plugin-version" ] && read -r v < "$HOME/.fuse/dm-setup/plugin-version"
+printf 'telemetry=%s\nclaude_calls=%s\nrecord=%s\n' "${T3CODE_TELEMETRY_ENABLED:-unset}" "$c" "$v" >> "$rec"
+[ -n "${FAKE_OPENER_STDERR:-}" ] && printf '%s\n' "$FAKE_OPENER_STDERR" >&2
+exit "${FAKE_OPENER_EXIT:-0}"
+'''
+FAKE_OSASCRIPT = r'''#!/bin/sh
+# fake osascript (OPX-1890): records its argv as $FAKE_DIR/osascript.<n> and runs no AppleScript. `end=yes` is written
+# last: the close runs in the background, so a reader polls for a complete record, never half of one.
+n=0; [ -f "$FAKE_DIR/osascript-count" ] && read -r n < "$FAKE_DIR/osascript-count"; n=$((n+1)); echo "$n" > "$FAKE_DIR/osascript-count"
+rec="$FAKE_DIR/osascript.$n"
+: > "$rec"
+for a in "$@"; do printf 'arg=%s\n' "$a" >> "$rec"; done
+printf 'end=yes\n' >> "$rec"
+exit 0
+'''
+FAKE_TTY = r'''#!/bin/sh
+# fake tty (OPX-1890): the launcher's own terminal is /dev/ttys099; FAKE_NO_TTY set -> `not a tty` and exit 1, as tty does
+if [ -n "${FAKE_NO_TTY:-}" ]; then echo "not a tty"; exit 1; fi
+echo /dev/ttys099
 '''
 
 
@@ -142,7 +179,8 @@ class Drive(unittest.TestCase):
         return subprocess.run([BASH, str(script or SCRIPT), *args], env=self.env(**extra), capture_output=True, text=True, timeout=60)
 
     def launches(self):
-        """Every invocation of the fake, in order: {argv0, args, cwd, launcher, effort_env, stdin_tty, stdin_is_dev_tty}."""
+        """Every invocation of the fake, in order: {argv0, args, cwd, launcher, effort_env, stdin_tty, stdin_is_dev_tty,
+        stdin_is_dev_null}."""
         out = []
         for f in sorted(self.fake_dir.glob("launch.*"), key=lambda p: int(p.name.split(".")[1])):
             rec = {"args": []}
@@ -730,6 +768,518 @@ class KeepCurrent(Drive):
         self.assertIn("keep-current", SCRIPT.read_text().split("set -u", 1)[0], "the header comment says it")
 
 
+class T3Surface(Drive):
+    """OPX-1890 (docs/spec/2026-10-02-fuse-dm-t3-icon-design.md, rulings A-K): bare `fuse-dm` (the Desktop icon) and
+    `update` open T3 Code when setup's row 15 configured it — ~/.fuse/dm-setup/t3-ready AND the app found — after the
+    keep-current check. Unchanged → no claude process at all, then the opener; moved → a headless keep-current pass (the
+    daily argv with `-p` right before the prompt, stdin from /dev/null, the same refusal retry), the record, then the
+    opener; a failed pass → today's terminal session on the prompt. In macOS Terminal a background `osascript` closes the
+    launcher's own window once its shell has ended (one tab, no process left in it). `term` and FUSE_DM_SURFACE=term are
+    today's session. Each "terminal" case first proves its fixture would open T3 Code (the control, run outside Terminal
+    so no close is in flight), then flips one condition, so no negative assertion is vacuous. Stdin is a pipe here
+    (`input=""`, as under CI), never /dev/null: `stdin_is_dev_null=yes` on a session is the launcher's own redirect."""
+
+    OLD, NEW = "0.0.1", "0.0.2"
+    REFUSAL = "Error: the model 'fable' is not available on this account"
+    UPDATE_LINES = [["plugin", "marketplace", "update", "fuse-internal"], ["plugin", "update", "deployment-manager@fuse-internal"]]
+    # the plan's "Shared names and strings", bash spelling, each said through `say`
+    MOVED_T3 = ("the plugin moved to {v} — re-checking the environment first, then T3 Code opens by itself (threads already "
+                "open there keep the old version until you start a new one)")
+    MOVED = "the plugin moved to {v} — re-checking the environment first, seconds"
+    NO_APP = "T3 Code is not where setup put it — the terminal session instead; fuse-dm setup puts it back"
+    OPEN_FAILED = "T3 Code did not open (exit {rc}) — the terminal session instead"
+    PASS_FAILED = "the re-check stopped (exit {rc}) — opening it in the terminal instead"
+    OPENING = "opening T3 Code"
+
+    def setUp(self):
+        super().setUp()
+        self.opener = write_exec(self.tmp / "opener", FAKE_OPENER)
+        write_exec(self.bin / "osascript", FAKE_OSASCRIPT)
+        write_exec(self.bin / "tty", FAKE_TTY)
+        self.runs = 0
+
+    def env(self, **extra):
+        return super().env(**{"FUSE_DM_OPENER": str(self.opener), "TERM_PROGRAM": "Apple_Terminal", **extra})
+
+    def run_dm(self, *args, **extra):
+        # stdin is a pipe (CI, `… | fuse-dm`), never /dev/null: the headless pass's /dev/null must be the launcher's doing
+        return subprocess.run([BASH, str(SCRIPT), *args], env=self.env(**extra), input="", capture_output=True, text=True, timeout=60)
+
+    def reset(self):
+        """A fresh FAKE_DIR for the next run: a background close from the run before lands in the old one, never here."""
+        self.runs += 1
+        self.fake_dir = self.tmp / f"fake-{self.runs}"
+        self.fake_dir.mkdir()
+
+    # ---- fixtures: KeepCurrent's shapes ----
+    def installed(self, version):
+        f = self.home / INSTALLED_PLUGINS
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps({"version": 2, "plugins": {"deployment-manager@fuse-internal": [
+            {"scope": "user", "installPath": str(self.tmp / "cache" / version), "version": version, "isLocal": False}]}}, indent=2) + "\n")
+
+    def record(self, version):
+        f = self.home / RECORD
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(version + "\n")
+
+    def recorded(self):
+        f = self.home / RECORD
+        return f.read_text().strip() if f.exists() else None
+
+    def ready(self, app=True, marker=True, record=NEW, installed=NEW):
+        """A machine row 15 finished on: the app at ~/Applications/T3 Code (Alpha).app (a directory, as the cask lands it),
+        the marker, the installed version and the record (None → none)."""
+        if app:
+            (self.home / T3_APP).mkdir(parents=True, exist_ok=True)
+        if marker:
+            (self.home / T3_MARKER).parent.mkdir(parents=True, exist_ok=True)
+            (self.home / T3_MARKER).write_text("2026-10-08T18:20:00Z\n")
+        if installed:
+            self.installed(installed)
+        if record:
+            self.record(record)
+
+    # ---- the fakes' records ----
+    def records(self, prefix):
+        out = []
+        for f in sorted(self.fake_dir.glob(prefix + ".*"), key=lambda p: int(p.name.split(".")[1])):
+            rec = {"args": []}
+            for line in f.read_text().splitlines():
+                k, v = line.split("=", 1)
+                if k == "arg":
+                    rec["args"].append(v)
+                else:
+                    rec[k] = v
+            out.append(rec)
+        return out
+
+    def openers(self):
+        return self.records("opener")
+
+    def wait_for(self, prefix="osascript", timeout=3.0):
+        """The close runs in the background: poll until a complete record (`end=yes`) is there, or the timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            done = [r for r in self.records(prefix) if r.get("end") == "yes"]
+            if done or time.monotonic() >= deadline:
+                return done
+            time.sleep(0.05)
+
+    def no_close(self):
+        """No `osascript` at all: a short beat first — a wrong close would be started right before the launcher exits."""
+        time.sleep(0.5)
+        return self.records("osascript")
+
+    @staticmethod
+    def applescript(args):
+        """osascript's argv split into the `-e` lines and what follows them (the script's own argv)."""
+        lines, i = [], 0
+        while i + 1 < len(args) and args[i] == "-e":
+            lines.append(args[i + 1])
+            i += 2
+        return lines, args[i:]
+
+    def lines(self, r):
+        return r.stdout.splitlines()
+
+    def said(self, r):
+        return [l for l in r.stdout.splitlines() if "re-checking" in l]
+
+    def assert_opens(self, r, why="the control: this machine opens T3 Code"):
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((len(self.openers()), self.sessions()), (1, []), f"{why}\n{r.stdout}{r.stderr}")
+
+    def assert_terminal(self, r, argv=DAILY_ARGV):
+        """Today's terminal session, exactly one, interactive (the DM's own stdin), and T3 Code never tried."""
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.sessions()
+        self.assertEqual([x["args"] for x in s], [argv], r.stdout + r.stderr)
+        self.assertEqual(s[0]["stdin_is_dev_null"], "no", "the terminal session keeps the DM's stdin")
+        self.assertEqual(self.openers(), [], "T3 Code is not opened")
+
+    # ---- AC1-AC11 ----
+    def test_ready_unchanged_opens_t3_starts_no_claude(self):
+        """AC1: ready and the version unchanged → no claude process at all (no session, no `plugin list`), the opener
+        once with the exact argv, one line said, exit 0, nothing written."""
+        self.ready()
+        r = self.run_dm()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.launches(), [], "no claude process on an unchanged version")
+        o = self.openers()
+        self.assertEqual(len(o), 1, r.stdout + r.stderr)
+        self.assertEqual(o[0]["args"], ["--env", "T3CODE_TELEMETRY_ENABLED=false", "-a", str(self.home / T3_APP)])
+        self.assertIn("fuse-dm: " + self.OPENING, self.lines(r))
+        self.assertEqual(self.said(r), [], "nothing moved: no re-checking line")
+        self.assertEqual(self.recorded(), self.NEW)
+
+    def test_closes_own_window_only_in_apple_terminal(self):
+        """AC2 + Review Focus 1-2: in macOS Terminal, right before exit 0, one background `osascript` gets the launcher's
+        tty as argv (never interpolated) and closes a window only when its ONE tab has that tty AND no process left —
+        a DM's own shell (alive) or a window with other tabs is never closed. Terminal scripting Terminal: no `System
+        Events`, no `quit`. Three checks, one second apart."""
+        self.ready()
+        r = self.run_dm()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        closes = self.wait_for()
+        self.assertEqual(len(closes), 1, f"one osascript, in the background\n{r.stdout}{r.stderr}")
+        lines, rest = self.applescript(closes[0]["args"])
+        self.assertEqual(rest, ["/dev/ttys099"], "the launcher's tty is the script's argv")
+        script = "\n".join(lines)
+        for token in ("on run argv", "item 1 of argv", "repeat 3 times", "delay 1", 'tell application "Terminal"',
+                      "(count of tabs of w) is 1", "tty of tab 1 of w is ttyName", "(count of (processes of tab 1 of w)) is 0",
+                      "close w"):
+            with self.subTest(token=token):
+                self.assertIn(token, script)
+        self.assertLess(script.index("(count of tabs of w) is 1"), script.index("close w"), "one tab, checked before the close")
+        self.assertLess(script.index("(count of (processes of tab 1 of w)) is 0"), script.index("close w"), "no process left, checked before the close")
+        for bad in ("quit", "System Events", "do script", "keystroke"):
+            with self.subTest(bad=bad):
+                self.assertNotIn(bad, script)
+        for line in lines:
+            self.assertNotIn("/dev/ttys099", line, "the tty only as argv, never inside the script text")
+
+    def test_other_terminal_app_closes_nothing(self):
+        """Ruling C: another terminal app (`TERM_PROGRAM` anything else, or none) → T3 Code opens, nothing is closed."""
+        self.ready()
+        for term in ("iTerm.app", "ghostty", None):
+            with self.subTest(TERM_PROGRAM=term):
+                self.reset()
+                r = self.run_dm(TERM_PROGRAM=term)
+                self.assert_opens(r, "T3 Code still opens")
+                self.assertEqual(self.no_close(), [], "no osascript outside Apple Terminal")
+
+    def test_no_tty_closes_nothing(self):
+        """Ruling C: `tty` does not answer → nothing is closed; T3 Code still opens."""
+        self.ready()
+        r = self.run_dm(FAKE_NO_TTY="1")
+        self.assert_opens(r, "T3 Code still opens")
+        self.assertEqual(self.no_close(), [])
+
+    def test_moved_runs_headless_pass_records_then_opens(self):
+        """AC3 + Review Focus 3: moved → the headless pass (the daily argv, `-p` right before the prompt, the prompt last,
+        stdin from /dev/null so a non-tty stdin is never waited on), the record rewritten, THEN the opener; one line,
+        the T3 Code one, said once."""
+        self.ready(record=self.OLD)
+        r = self.run_dm()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.sessions()
+        self.assertEqual(len(s), 1, r.stdout + r.stderr)
+        self.assertEqual(s[0]["args"], DAILY_ARGV + ["-p", KEEP_CURRENT_PROMPT], "the daily argv, -p, the prompt last")
+        self.assertEqual(s[0]["stdin_is_dev_null"], "yes", "the headless pass reads /dev/null, never the DM's stdin")
+        self.assertEqual(Path(s[0]["cwd"]).resolve(), (self.home / "Fuse").resolve())
+        self.assertEqual(s[0]["launcher"], "unset", "a daily session: no FUSE_DM_LAUNCHER")
+        self.assertEqual(len(self.launches()), 1, "the version is read from installed_plugins.json, no plugin list")
+        self.assertEqual(self.recorded(), self.NEW, "the record after the clean pass")
+        o = self.openers()
+        self.assertEqual(len(o), 1)
+        self.assertEqual(o[0]["claude_calls"], "1", "the opener runs after the pass")
+        self.assertEqual(o[0]["record"], self.NEW, "and after the record")
+        self.assertEqual(self.lines(r).count("fuse-dm: " + self.MOVED_T3.format(v=self.NEW)), 1, r.stdout)
+        self.assertNotIn(self.MOVED.format(v=self.NEW), r.stdout, "the terminal path's line is not this path's")
+        self.assertIn("fuse-dm: " + self.OPENING, self.lines(r))
+
+    def test_failed_pass_falls_back_to_terminal(self):
+        """Ruling G: the headless pass fails → nothing recorded by it, one line, then today's terminal session on the
+        keep-current prompt (no `-p`, interactive), its record after a clean exit, its exit code; T3 Code not opened."""
+        for exits, code, record in (("3,0", 0, self.NEW), ("3,5", 5, self.OLD)):
+            with self.subTest(FAKE_CLAUDE_EXIT=exits):
+                self.reset()
+                self.ready(record=self.OLD)
+                r = self.run_dm(FAKE_CLAUDE_EXIT=exits)
+                self.assertEqual(r.returncode, code, r.stderr)
+                s = self.sessions()
+                self.assertEqual([x["args"] for x in s], [DAILY_ARGV + ["-p", KEEP_CURRENT_PROMPT], DAILY_ARGV + [KEEP_CURRENT_PROMPT]],
+                                 r.stdout + r.stderr)
+                self.assertEqual(s[1]["stdin_is_dev_null"], "no", "the terminal session is interactive")
+                self.assertIn("fuse-dm: " + self.PASS_FAILED.format(rc=3), self.lines(r))
+                self.assertEqual(self.openers(), [], "T3 Code is not opened after a failed pass")
+                self.assertEqual(self.recorded(), record, "recorded only after the terminal session's clean exit")
+                self.assertEqual(self.no_close(), [])
+
+    def test_headless_refusal_retry_keeps_p(self):
+        """Review Focus 4: the seat refuses fable on the headless pass → the one opus retry keeps `-p` and the prompt last,
+        stdin still /dev/null; then the record and the opener."""
+        self.ready(record=self.OLD)
+        r = self.run_dm(FAKE_CLAUDE_EXIT="1,0", FAKE_CLAUDE_STDERR=self.REFUSAL)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.sessions()
+        self.assertEqual([x["args"] for x in s], [DAILY_ARGV + ["-p", KEEP_CURRENT_PROMPT],
+                                                   ["--model", "opus", "--permission-mode", "auto", "-p", KEEP_CURRENT_PROMPT]])
+        self.assertEqual([x["stdin_is_dev_null"] for x in s], ["yes", "yes"])
+        self.assertEqual(self.recorded(), self.NEW)
+        o = self.openers()
+        self.assertEqual(len(o), 1)
+        self.assertEqual(o[0]["claude_calls"], "2", "after the retry")
+        self.assertNotIn("the re-check stopped", r.stdout)
+
+    def test_app_without_marker_is_terminal(self):
+        """AC4: T3 Code installed but row 15 never wrote the marker → today's session, nothing said about T3 Code."""
+        self.ready()
+        self.assert_opens(self.run_dm(TERM_PROGRAM=None))
+        (self.home / T3_MARKER).unlink()
+        self.reset()
+        r = self.run_dm()
+        self.assert_terminal(r)
+        self.assertNotIn("T3 Code", r.stdout, "setup has not set it up: nothing to say about it")
+        self.assertEqual(self.no_close(), [])
+
+    def test_marker_without_app_is_terminal(self):
+        """AC5 + ruling F: the marker without the app (dragged to the Bin) → one line, then today's session; the marker is
+        setup's and stays. FUSE_DM_T3_APP set is the only place looked at: a missing path is no app, even with one in
+        ~/Applications. Both runs name a missing FUSE_DM_T3_APP, so the machine's own /Applications is never read."""
+        self.ready()
+        self.assert_opens(self.run_dm(TERM_PROGRAM=None))
+        shutil.rmtree(self.home / "Applications")
+        missing = {"FUSE_DM_T3_APP": str(self.tmp / "missing" / "T3 Code.app")}
+        for how, extra, app_in_home in (("removed", missing, False), ("FUSE_DM_T3_APP missing", missing, True)):
+            with self.subTest(how=how):
+                if app_in_home:
+                    (self.home / T3_APP).mkdir(parents=True, exist_ok=True)
+                self.reset()
+                r = self.run_dm(**extra)
+                self.assertEqual(self.lines(r).count("fuse-dm: " + self.NO_APP), 1, r.stdout + r.stderr)
+                self.assert_terminal(r)
+                self.assertTrue((self.home / T3_MARKER).is_file(), "the marker is setup's: never removed by the launcher")
+
+    def test_term_verb_is_todays_session(self):
+        """AC6: `fuse-dm term` is today's daily session, ready or not: the same keep-current check in the terminal (no
+        `-p`, the old line), never the opener, never a close."""
+        self.ready()
+        r = self.run_dm("term")
+        self.assert_terminal(r)
+        self.assertEqual(self.no_close(), [])
+        self.reset()
+        self.record(self.OLD)
+        r = self.run_dm("term")
+        self.assert_terminal(r, DAILY_ARGV + [KEEP_CURRENT_PROMPT])
+        self.assertEqual(self.lines(r).count("fuse-dm: " + self.MOVED.format(v=self.NEW)), 1, r.stdout)
+        self.assertNotIn("T3 Code opens by itself", r.stdout)
+        self.assertEqual(self.recorded(), self.NEW)
+        (self.home / T3_MARKER).unlink()
+        self.reset()
+        self.assert_terminal(self.run_dm("term"))
+
+    def test_update_then_hand_over(self):
+        """AC7 + ruling H: `update` = its two lines, then exactly bare fuse-dm's path: unchanged → the opener after them
+        (no session) and the close in Terminal; moved → the headless pass, the record, the opener."""
+        self.ready()
+        r = self.run_dm("update")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([l["args"] for l in self.launches()], self.UPDATE_LINES, r.stdout + r.stderr)
+        o = self.openers()
+        self.assertEqual(len(o), 1, r.stdout + r.stderr)
+        self.assertEqual(o[0]["claude_calls"], "2", "after the two update lines")
+        self.assertIn("fuse-dm: " + self.OPENING, self.lines(r))
+        self.assertEqual(len(self.wait_for()), 1, "the same close step as the bare verb")
+        self.reset()
+        self.record(self.OLD)
+        r = self.run_dm("update", TERM_PROGRAM=None)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([l["args"] for l in self.launches()], self.UPDATE_LINES + [DAILY_ARGV + ["-p", KEEP_CURRENT_PROMPT]])
+        self.assertEqual(self.launches()[-1]["stdin_is_dev_null"], "yes")
+        self.assertEqual(self.recorded(), self.NEW)
+        self.assertEqual([x["claude_calls"] for x in self.openers()], ["3"])
+
+    def test_opener_argv_and_env(self):
+        """AC8 + ruling E: macOS `open --env T3CODE_TELEMETRY_ENABLED=false -a <app>` (open hands the variable to the
+        app's own environment); FUSE_DM_T3_APP names the app when set; Git Bash puts the variable in the opener's own
+        environment (cmd's `start` passes it to the app)."""
+        self.ready()
+        self.run_dm(TERM_PROGRAM=None)
+        self.assertEqual([o["args"] for o in self.openers()], [["--env", "T3CODE_TELEMETRY_ENABLED=false", "-a", str(self.home / T3_APP)]])
+        elsewhere = self.tmp / "Elsewhere" / "T3 Code.app"
+        elsewhere.mkdir(parents=True)
+        self.reset()
+        self.run_dm(FUSE_DM_T3_APP=str(elsewhere), TERM_PROGRAM=None)
+        self.assertEqual([o["args"] for o in self.openers()], [["--env", "T3CODE_TELEMETRY_ENABLED=false", "-a", str(elsewhere)]])
+        exe = self.tmp / "Programs" / "t3code" / "T3 Code (Alpha).exe"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("")
+        self.reset()
+        self.run_dm(FUSE_DM_OSTYPE="msys", FUSE_DM_T3_APP=str(exe))
+        self.assertEqual([o["telemetry"] for o in self.openers()], ["false"], "Git Bash: the opener's own environment")
+
+    def test_app_is_found_by_its_glob_never_its_name(self):
+        """Ruling E: the launcher never writes the product name — the first `T3 Code*.app` in ~/Applications, so the
+        successor of "T3 Code (Alpha)" is found the same way; neither script spells "(Alpha)"."""
+        self.ready(app=False)
+        successor = self.home / "Applications" / "T3 Code.app"
+        successor.mkdir(parents=True)
+        r = self.run_dm(TERM_PROGRAM=None)
+        self.assert_opens(r, "the successor's name is found by the glob")
+        self.assertEqual(self.openers()[0]["args"][-1], str(successor))
+        for f in (SCRIPT, PS1):
+            with self.subTest(file=f.name):
+                self.assertNotIn("(Alpha)", f.read_text() if f.is_file() else "")
+
+    def test_surface_term_override(self):
+        """AC9: FUSE_DM_SURFACE=term → bare and `update` take today's session on a ready machine; any other value (or
+        none) → the surface rule."""
+        self.ready()
+        self.reset()
+        self.assert_opens(self.run_dm(FUSE_DM_SURFACE="auto", TERM_PROGRAM=None), "FUSE_DM_SURFACE other than term: the surface rule")
+        self.reset()
+        r = self.run_dm(FUSE_DM_SURFACE="term")
+        self.assert_terminal(r)
+        self.assertEqual(self.no_close(), [])
+        self.reset()
+        r = self.run_dm("update", FUSE_DM_SURFACE="term")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([l["args"] for l in self.launches()], self.UPDATE_LINES + [DAILY_ARGV])
+        self.assertEqual(self.openers(), [])
+
+    def test_opener_failure_is_terminal(self):
+        """Ruling F: the opener exits non-zero → one line, then today's session; no `opening` line, no close."""
+        self.ready()
+        r = self.run_dm(FAKE_OPENER_EXIT="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.openers()), 1, "the opener was tried")
+        self.assertEqual(self.lines(r).count("fuse-dm: " + self.OPEN_FAILED.format(rc=1)), 1, r.stdout + r.stderr)
+        self.assertNotIn("fuse-dm: " + self.OPENING, self.lines(r))
+        s = self.sessions()
+        self.assertEqual([x["args"] for x in s], [DAILY_ARGV])
+        self.assertEqual(s[0]["stdin_is_dev_null"], "no")
+        self.assertEqual(self.no_close(), [])
+
+    # the rehearsal finding: macOS `open --env … -a` on a T3 Code already running exits 0 and says this on stderr
+    ALREADY_RUNNING = ("Application ~/Applications/T3 Code (Alpha).app was already running and so the additional "
+                       "environment variables could not be set.")
+
+    def open_errs(self):
+        """The opener's kept stderr files left in TMPDIR (the harness sets it to self.tmp)."""
+        return sorted(p.name for p in self.tmp.glob("fuse-dm.*.open.err"))
+
+    def test_opener_stderr_hidden_on_success(self):
+        """Rehearsal finding: the opener exits 0 after writing to stderr (an already-running T3 Code) → the DM sees the
+        one `opening` line and nothing else; the kept stderr is removed. Control: the fake does write the text."""
+        control = subprocess.run([str(self.opener)], env=self.env(FAKE_DIR=str(self.tmp), FAKE_OPENER_STDERR=self.ALREADY_RUNNING),
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual((control.returncode, control.stderr), (0, self.ALREADY_RUNNING + "\n"), "the fake writes the text")
+        self.ready()
+        r = self.run_dm(TERM_PROGRAM=None, FAKE_OPENER_STDERR=self.ALREADY_RUNNING)
+        self.assert_opens(r)
+        self.assertNotIn("already running", r.stdout + r.stderr)
+        self.assertEqual(self.lines(r), ["fuse-dm: " + self.OPENING], r.stdout + r.stderr)
+        self.assertEqual(r.stderr, "")
+        self.assertEqual(self.open_errs(), [], "no kept stderr left in TMPDIR")
+
+    def test_opener_stderr_shown_on_failure(self):
+        """The opener exits non-zero → what it wrote to stderr is shown on stderr, right before the unchanged failure
+        line, then today's session; the kept stderr is removed."""
+        self.ready()
+        r = self.run_dm(FAKE_OPENER_EXIT="1", FAKE_OPENER_STDERR=self.ALREADY_RUNNING)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr.splitlines().count(self.ALREADY_RUNNING), 1, r.stdout + r.stderr)
+        self.assertNotIn("already running", r.stdout)
+        self.assertEqual(self.lines(r).count("fuse-dm: " + self.OPEN_FAILED.format(rc=1)), 1, r.stdout + r.stderr)
+        self.assertEqual([x["args"] for x in self.sessions()], [DAILY_ARGV])
+        self.assertEqual(self.open_errs(), [], "no kept stderr left in TMPDIR")
+        self.reset()                # the order, in the one stream the DM's window shows
+        both = subprocess.run([BASH, str(SCRIPT)], env=self.env(FAKE_OPENER_EXIT="1", FAKE_OPENER_STDERR=self.ALREADY_RUNNING),
+                              input="", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+        seen = both.stdout.splitlines()
+        failed = "fuse-dm: " + self.OPEN_FAILED.format(rc=1)
+        self.assertIn(failed, seen, both.stdout)
+        self.assertEqual(seen[seen.index(failed) - 1], self.ALREADY_RUNNING, both.stdout)
+        self.assertEqual(self.open_errs(), [])
+        self.assertEqual(self.no_close(), [])
+
+    def test_no_record_ready_records_and_opens(self):
+        """Ruling I: no record yet and ready → the installed version recorded, then T3 Code opens; no pass forced."""
+        self.ready(record=None)
+        r = self.run_dm(TERM_PROGRAM=None)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.launches(), [], "no pass forced, no claude process")
+        self.assertEqual(self.recorded(), self.NEW)
+        self.assertEqual([o["record"] for o in self.openers()], [self.NEW], "recorded before the opener runs")
+        self.assertEqual(self.said(r), [])
+
+    def test_git_bash_opener(self):
+        """Ruling E (Axel's Windows status, 10-05: winget's per-user install is `%LOCALAPPDATA%\\Programs\\t3code\\`,
+        not a `T3 Code*` folder): under Git Bash the app is FUSE_DM_T3_APP, else the first
+        `~/AppData/Local/Programs/t3code/T3 Code*.exe` (never its `Uninstall T3 Code*.exe`);
+        `T3CODE_TELEMETRY_ENABLED=false cmd //c start "" <exe>` (Unverified); no close step there even when TERM_PROGRAM
+        says Apple_Terminal (the console closes by itself when bash ends)."""
+        programs = self.home / "AppData" / "Local" / "Programs"
+        seam = self.tmp / "t3code" / "T3 Code (Alpha).exe"
+        default = programs / "t3code" / "T3 Code (Alpha).exe"
+        for exe in (seam, default, programs / "t3code" / "Uninstall T3 Code (Alpha).exe"):
+            exe.parent.mkdir(parents=True, exist_ok=True)
+            exe.write_text("")
+        self.ready(app=False)
+        for how, extra, exe in (("FUSE_DM_T3_APP", {"FUSE_DM_T3_APP": str(seam)}, seam), ("the default folder", {}, default)):
+            with self.subTest(how=how):
+                self.reset()
+                r = self.run_dm(FUSE_DM_OSTYPE="msys", **extra)
+                self.assert_opens(r, "Git Bash opens T3 Code")
+                o = self.openers()[0]
+                self.assertEqual(o["args"], ["//c", "start", "", str(exe)])
+                self.assertEqual(o["telemetry"], "false")
+                self.assertEqual(self.no_close(), [], "no osascript under Git Bash")
+        with self.subTest(how="only the old guess, a `T3 Code*` folder"):
+            shutil.rmtree(programs / "t3code")
+            guess = programs / "T3 Code (Alpha)" / "T3 Code (Alpha).exe"
+            guess.parent.mkdir(parents=True)
+            guess.write_text("")
+            self.reset()
+            r = self.run_dm(FUSE_DM_OSTYPE="msys")
+            self.assertEqual(self.lines(r).count("fuse-dm: " + self.NO_APP), 1, r.stdout + r.stderr)
+            self.assert_terminal(r)
+
+    def test_linux_with_marker_is_terminal(self):
+        """Review Focus 5: FUSE_DM_OSTYPE=linux-gnu (WSL, CI) with a marker → today's session, no opener call."""
+        self.ready()
+        self.assert_opens(self.run_dm(TERM_PROGRAM=None))
+        self.reset()
+        self.assert_terminal(self.run_dm(FUSE_DM_OSTYPE="linux-gnu"))
+        self.assertEqual(self.no_close(), [])
+
+    def test_help_names_term_and_override(self):
+        """AC11: the usage line is the shared one; the verbs gain `term`, the bare line says what it opens, and the
+        environment names the three seams — on the bare PATH, no external needed."""
+        r = self.run_dm("--help", PATH=str(self.bin))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.lines(r)[0], USAGE)
+        self.assertEqual(bash_line(r"^USAGE='([^']*)'$"), USAGE)
+        self.assertRegex(r.stdout, r"(?m)^  term\s", "a `term` verb line, in the help's own layout")
+        for token in ("T3 Code", "FUSE_DM_SURFACE", "FUSE_DM_T3_APP", "FUSE_DM_OPENER"):
+            with self.subTest(token=token):
+                self.assertIn(token, r.stdout)
+        self.assertEqual(self.launches(), [])
+
+    # ---- the launcher's own limits on this path ----
+    def test_t3_path_reads_the_marker_only(self):
+        """Spec § The launcher, Never: no write to the marker or the state file, no T3 Code install, no permission mode
+        for T3 Code, no quit of any app — behaviour and text."""
+        self.ready()
+        m = self.home / T3_MARKER
+        before = (m.read_text(), m.stat().st_mtime_ns)
+        r = self.run_dm(TERM_PROGRAM=None)
+        self.assert_opens(r)
+        self.assertEqual((m.read_text(), m.stat().st_mtime_ns), before, "the marker is untouched")
+        self.assertIsNone(self.state(), "the state file is not the launcher's")
+        text = SCRIPT.read_text()
+        self.assertIn('T3_MARKER="$HOME/.fuse/dm-setup/t3-ready"', text)
+        self.assertNotRegex(text, r'(>|>>)\s*"?\$\{?T3_MARKER', "no redirect into the marker")
+        self.assertNotRegex(text, r"(?m)\brm\b[^\n]*T3_MARKER", "no removal of the marker")
+        for bad in ("brew ", "t3.codes", "winget", "full-access", "killall", "System Events"):
+            with self.subTest(bad=bad):
+                self.assertNotIn(bad, text)
+
+    def test_t3_path_externals(self):
+        """Spec § The launcher, Externals: the header names `osascript` (macOS Terminal only) and T3 Code; the close is
+        HUP-proof; no `sleep`, `ps`, `pgrep` — the AppleScript's own `delay` waits."""
+        text = SCRIPT.read_text()
+        head = text.split("set -u", 1)[0]
+        for needle in ("osascript", "T3 Code", "fuse-dm term"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, head)
+        self.assertIn("trap '' HUP", text)
+        self.assertNotRegex(text, r"\b(sleep|pgrep|killall)\b")
+        self.assertNotRegex(text, r"(?m)(^|[\s;&|(])ps\s+-", "no ps")
+
+
 def bash_line(pattern, where="bin/fuse-dm"):
     """One contract literal read out of the bash script at test time — never a copy kept here (the Drift idiom of
     bootstrap/tests/test_fuse_start_contracts.py): whichever file changes, the other's pin fails."""
@@ -749,6 +1299,14 @@ def ascii_dash(text):
     """The bash messages use an em dash; the ps1 is 7-bit ASCII (Windows PowerShell 5.1 reads a BOM-less file as
     cp1252), so its messages carry ` - ` where bash has ` — `. Everything else is byte-identical."""
     return text.replace(" — ", " - ")
+
+
+def ps1_code(line):
+    """One ps1 line with its string literals emptied and its comment cut: what PowerShell runs, not what it says
+    (OPX-1890: `'the re-check stopped (exit '` is a message, not an exit)."""
+    line = re.sub(r"'(?:[^']|'')*'", "''", line)
+    line = re.sub(r'"(?:[^"`]|`.)*"', '""', line)
+    return line.split("#", 1)[0]
 
 
 class Parity(unittest.TestCase):
@@ -919,9 +1477,53 @@ class Parity(unittest.TestCase):
                 self.assertNotIn(bad, text)
         self.assertEqual(text.count("--dangerously-skip-permissions"), 1)
         self.assertNotRegex(text, r"(?m)^.*StateFile.*(Set-Content|Out-File|Add-Content|WriteAllText|WriteAllLines|\s>\s).*$", "the launcher only reads the state file")
-        exits = [l for l in text.splitlines() if "exit " in l]
+        # OPX-1890: an `exit` statement, not the word inside a message — the T3 Code lines say `(exit N)` in a string
+        exits = [l for l in text.splitlines() if re.search(r"(?<![\w$.-])exit\b", ps1_code(l), flags=re.I)]
         self.assertEqual(len(exits), 1, exits)
         self.assertIn("$PSCommandPath", exits[0], "under iex the body returns; only a file run exits")
+
+    def test_t3_surface_literals_match(self):
+        """OPX-1890 AC10: the T3 Code surface, literal for literal — the headless argv (`-p` right before the prompt),
+        the `term` verb, the marker in the ps1's path spelling, the usage lines, the telemetry variable (bash: open's
+        `--env` and the Git Bash prefix; ps1: set in its own process around the opener), and Windows closes nothing."""
+        bash, text = SCRIPT.read_text(), ps1_text()
+        for env in ("FUSE_DM_SURFACE", "FUSE_DM_T3_APP", "FUSE_DM_OPENER", "T3CODE_TELEMETRY_ENABLED"):
+            with self.subTest(env=env):
+                self.assertIn(env, bash)
+                self.assertIn(env, text)
+        self.assertIn('--model "$MODEL" --permission-mode auto -p "$KEEP_CURRENT_PROMPT"', bash)
+        self.assertIn("'--model', $script:Model, '--permission-mode', 'auto', '-p', $script:KeepCurrentPrompt", text)
+        self.assertIn("  term) ", bash)
+        self.assertIn("'term'", text)
+        self.assertIn('"$HOME/.fuse/dm-setup/t3-ready"', bash)
+        self.assertIn("[IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 't3-ready')", text)
+        self.assertEqual(bash_line(r"^USAGE='([^']*)'$"), USAGE)
+        self.assertIn(f"$Usage = '{PS1_USAGE}'", text)
+        self.assertIn("--env T3CODE_TELEMETRY_ENABLED=false -a", bash)
+        self.assertIn("T3CODE_TELEMETRY_ENABLED=false \"${FUSE_DM_OPENER:-cmd}\" //c start \"\"", bash)
+        self.assertIn("\"${FUSE_DM_OPENER:-open}\"", bash)
+        self.assertIn("$env:T3CODE_TELEMETRY_ENABLED = 'false'", text)
+        self.assertNotIn("osascript", text, "Windows closes no window")
+        # Axel's Windows status (10-05): the app's folder is `t3code` under %LOCALAPPDATA%\Programs, the .exe one level down
+        self.assertIn('"$HOME"/AppData/Local/Programs/t3code/T3\\ Code*.exe', bash)
+        self.assertIn("[IO.Path]::Combine($env:LOCALAPPDATA, 'Programs', 't3code')", text)
+        self.assertIn("-Filter 'T3 Code*.exe'", text)
+
+    def test_t3_messages_match_with_ascii_dashes(self):
+        """OPX-1890: the T3 Code lines, read from bash, asserted in the ps1 with ` — ` → ` - `; the two `(exit N)` lines
+        by their fixed halves, whatever the variable is called."""
+        bash, text = SCRIPT.read_text(), ps1_text()
+        for pattern in (r'say "the plugin moved to \$INSTALLED( — re-checking the environment first, then T3 Code opens by itself '
+                        r'\(threads already open there keep the old version until you start a new one\))"',
+                        r'say "(T3 Code is not where setup put it — the terminal session instead; fuse-dm setup puts it back)"',
+                        r'say "(opening T3 Code)"',
+                        r'say "(T3 Code did not open \(exit )\$\{?[A-Za-z_]+\}?(\) — the terminal session instead)"',
+                        r'say "(the re-check stopped \(exit )\$\{?[A-Za-z_]+\}?(\) — opening it in the terminal instead)"'):
+            match = re.search(pattern, bash, flags=re.M)
+            with self.subTest(pattern=pattern[:48]):
+                self.assertIsNotNone(match, f"bin/fuse-dm: no line matches {pattern!r}")
+                for fragment in match.groups():
+                    self.assertIn(ascii_dash(fragment), text)
 
 
 class Hygiene(unittest.TestCase):
