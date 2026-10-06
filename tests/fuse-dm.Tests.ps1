@@ -6,8 +6,9 @@
 # $FAKE_DIR/launch.<n> (argv0, one arg= line per argument, the cwd, and the env it saw: launcher=, effort_env=, git_bash=),
 # answers `plugin list` from $FAKE_PLUGIN_LIST, exits `plugin marketplace` / `plugin update` with $FAKE_UPDATE_RC, writes
 # the state file when FAKE_CLAUDE_WRITE_STATE tells it to (the nth comma-separated value on the nth session launch) and
-# exits with FAKE_CLAUDE_EXIT's nth value, FAKE_CLAUDE_STDERR on stderr. The fake `winget` records its argv and creates the
-# file FUSE_DM_GIT_BASH names. The real `claude`, `winget` and installer are never executed.
+# exits with FAKE_CLAUDE_EXIT's nth value, FAKE_CLAUDE_STDERR on stderr; OPX-2020: every session call also prints
+# FAKE_CLAUDE_STDOUT on stdout (the quick pass's reply), and FUSE_DM_HOLD is 0 unless a case sets it. The fake `winget`
+# records its argv and creates the file FUSE_DM_GIT_BASH names. The real `claude`, `winget` and installer are never executed.
 #
 # The primary shell is Windows PowerShell 5.1 (the DM's shell, powershell.exe); FUSE_DM_TEST_SHELL=pwsh runs the same suite
 # under pwsh. Off Windows (a Mac with pwsh) every case runs except the ones that need powershell.exe, a .cmd or
@@ -92,6 +93,7 @@ $lines += ('cwd=' + [IO.Directory]::GetCurrentDirectory())
 $lines += ('launcher=' + (Get-EnvOrUnset 'FUSE_DM_LAUNCHER'))
 $lines += ('effort_env=' + (Get-EnvOrUnset 'CLAUDE_CODE_EFFORT_LEVEL'))
 $lines += ('git_bash=' + (Get-EnvOrUnset 'CLAUDE_CODE_GIT_BASH_PATH'))
+$lines += ('config_dir=' + (Get-EnvOrUnset 'CLAUDE_CONFIG_DIR'))
 [IO.File]::WriteAllLines((Join-Path $fakeDir ('launch.' + $n)), [string[]]$lines)
 $head = ''
 if ($rest.Count -ge 2) { $head = [string]$rest[0] + ' ' + [string]$rest[1] }
@@ -99,6 +101,8 @@ if ($head -eq 'plugin list') { [Console]::Out.WriteLine([string]$env:FAKE_PLUGIN
 if ($head -eq 'plugin marketplace' -or $head -eq 'plugin update') { $rc = 0; if ($env:FAKE_UPDATE_RC) { $rc = [int]$env:FAKE_UPDATE_RC }; exit $rc }
 $s = (Read-Number 'sessions') + 1
 [IO.File]::WriteAllText((Join-Path $fakeDir 'sessions'), [string]$s)
+# OPX-2020: what the session prints on stdout (the quick pass's reply), on every session call
+if ($env:FAKE_CLAUDE_STDOUT) { [Console]::Out.WriteLine([string]$env:FAKE_CLAUDE_STDOUT) }
 $st = Get-Nth $env:FAKE_CLAUDE_WRITE_STATE $s
 if ($st) {
     $homeDir = $env:USERPROFILE
@@ -168,7 +172,9 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
             'FAKE_PLUGIN_LIST', 'FAKE_CLAUDE_WRITE_STATE', 'FAKE_CLAUDE_EXIT', 'FAKE_CLAUDE_STDERR', 'FAKE_UPDATE_RC',
             'FUSE_DM_MODEL', 'FUSE_DM_EFFORT', 'FUSE_DM_BOOTSTRAP_URL', 'FUSE_DM_INSTALLER', 'FUSE_DM_GIT_BASH',
             'FUSE_DM_LAUNCHER', 'CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_GIT_BASH_PATH',
-            'FUSE_DM_SURFACE', 'FUSE_DM_T3_APP', 'FUSE_DM_OPENER', 'FAKE_OPENER_EXIT', 'T3CODE_TELEMETRY_ENABLED', 'LOCALAPPDATA')   # OPX-1890
+            'FUSE_DM_SURFACE', 'FUSE_DM_T3_APP', 'FUSE_DM_OPENER', 'FAKE_OPENER_EXIT', 'T3CODE_TELEMETRY_ENABLED', 'LOCALAPPDATA',   # OPX-1890
+            'CLAUDE_CONFIG_DIR',   # OPX-2024
+            'FAKE_CLAUDE_STDOUT', 'FUSE_DM_HOLD')   # OPX-2020
         $script:PluginListAbsent = "Installed plugins:`n`n  > slack@claude-plugins-official`n    Version: 1.0.0`n    Scope: user`n    Status: enabled`n"
         $script:PluginListPresent = $script:PluginListAbsent + "`n  > deployment-manager@fuse-internal`n    Version: 0.0.0`n    Scope: user`n    Status: enabled`n"
         $script:BootstrapUrl = 'https://github.com/FuseFinance/dm-start/releases/latest/download/fuse-start.zip'
@@ -233,7 +239,7 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
             return @{ Code = [int]$p.ExitCode; Out = [IO.File]::ReadAllText($out); Err = [IO.File]::ReadAllText($err) }
         }
         function Get-Launches {
-            # every invocation of the fake, in order: @{ Argv0; Args; Cwd; Launcher; EffortEnv; GitBash }
+            # every invocation of the fake, in order: @{ Argv0; Args; Cwd; Launcher; EffortEnv; GitBash; ConfigDir }
             $records = @()
             $files = Get-ChildItem -LiteralPath $script:T.Fake -Filter 'launch.*' -ErrorAction SilentlyContinue | Sort-Object { [int]($_.Name.Split('.')[1]) }
             foreach ($f in $files) {
@@ -248,6 +254,7 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
                         'launcher' { $rec.Launcher = $v }
                         'effort_env' { $rec.EffortEnv = $v }
                         'git_bash' { $rec.GitBash = $v }
+                        'config_dir' { $rec.ConfigDir = $v }
                     }
                 }
                 $records += $rec
@@ -274,8 +281,10 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
         # OPX-1366: the installed version (installed_plugins.json as Claude Code writes it - pretty-printed, the entry an
         # array of one object) and the launcher's own record beside the state word; the versions are fixtures, never the
         # plugin's own (the Python suite's rule, scripts/tests/test_version_single_source.py)
-        function Set-InstalledPlugins([string]$Version) {
-            $dir = [IO.Path]::Combine($script:T.Home, '.claude', 'plugins')
+        function Set-InstalledPlugins([string]$Version, [string]$ConfigDir) {
+            # OPX-2024: in ~/.claude, or in the Claude folder named
+            if (-not $ConfigDir) { $ConfigDir = Join-Path $script:T.Home '.claude' }
+            $dir = Join-Path $ConfigDir 'plugins'
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
             $text = @"
 {
@@ -303,6 +312,12 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
             $dir = [IO.Path]::Combine($script:T.Home, '.fuse', 'dm-setup')
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
             [IO.File]::WriteAllText((Join-Path $dir 'plugin-version'), $Version + "`n")
+        }
+        function Set-ConfigRecord([string]$Text) {
+            # OPX-2024: the record of the Claude folder that bin/fuse-dm's install-shim writes (under Git Bash)
+            $dir = [IO.Path]::Combine($script:T.Home, '.fuse', 'dm-setup')
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            [IO.File]::WriteAllText((Join-Path $dir 'claude-config-dir'), $Text)
         }
         function Get-Record {
             $f = [IO.Path]::Combine($script:T.Home, '.fuse', 'dm-setup', 'plugin-version')
@@ -351,9 +366,11 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
         Set-Env 'FAKE_PLUGIN_LIST' $script:PluginListAbsent
         Set-Env 'FUSE_DM_INSTALLER' (Get-Installer $script:InstallerNoop)   # never the real installer from a test
         Set-Env 'FUSE_DM_GIT_BASH' $script:T.GitBash
+        Set-Env 'FUSE_DM_HOLD' '0'                               # OPX-2020: no hold unless a case asks for one
         foreach ($k in @('FAKE_CLAUDE_WRITE_STATE', 'FAKE_CLAUDE_EXIT', 'FAKE_CLAUDE_STDERR', 'FAKE_UPDATE_RC', 'FUSE_DM_MODEL', 'FUSE_DM_EFFORT',
                 'FUSE_DM_BOOTSTRAP_URL', 'FUSE_DM_LAUNCHER', 'CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_GIT_BASH_PATH',
-                'FUSE_DM_SURFACE', 'FUSE_DM_T3_APP', 'FUSE_DM_OPENER', 'FAKE_OPENER_EXIT', 'T3CODE_TELEMETRY_ENABLED')) { Set-Env $k $null }
+                'FUSE_DM_SURFACE', 'FUSE_DM_T3_APP', 'FUSE_DM_OPENER', 'FAKE_OPENER_EXIT', 'T3CODE_TELEMETRY_ENABLED', 'CLAUDE_CONFIG_DIR',
+                'FAKE_CLAUDE_STDOUT')) { Set-Env $k $null }
     }
 
     AfterEach {
@@ -871,6 +888,72 @@ New-Item -ItemType HardLink -Path (Join-Path $dir $name) -Target (Join-Path $env
         }
     }
 
+    Describe 'ClaudeConfigDir' {
+        # OPX-2024 (AC1, AC3): $InstalledPlugins comes from bin/fuse-dm's one rule, in the same three steps -
+        # CLAUDE_CONFIG_DIR when set (a leading ~ expanded), else the folder the record ~/.fuse/dm-setup/claude-config-dir
+        # names (its first line, an existing folder), else ~/.claude - and $env:CLAUDE_CONFIG_DIR is set for every claude
+        # only when the record decided it. Each candidate folder registers its own version and no version record exists,
+        # so the clean run records the version it read: that names the folder the rule chose. Mirrors test_launcher.py's
+        # ClaudeConfigDir and ConfigDirLaunch.
+
+        It 'every case gives bin/fuse-dm''s folder, and only the record sets the variable (AC1)' {
+            $fuse = Join-Path $script:T.Home '.claude-fuse'
+            $elsewhere = Join-Path $script:T.Tmp 'elsewhere'
+            Set-InstalledPlugins '0.0.1'
+            Set-InstalledPlugins '0.0.2' $fuse
+            Set-InstalledPlugins '0.0.3' $elsewhere
+            $cases = @(
+                @{ Name = 'env unset, no record'; Env = $null; Record = $null; Version = '0.0.1'; Seen = 'unset' },
+                @{ Name = 'env empty'; Env = ''; Record = $null; Version = '0.0.1'; Seen = 'unset' },
+                @{ Name = 'env set'; Env = $elsewhere; Record = $null; Version = '0.0.3'; Seen = $elsewhere },
+                @{ Name = 'env with a leading ~'; Env = '~/.claude-fuse'; Record = $null; Version = '0.0.2'; Seen = '~/.claude-fuse' },
+                @{ Name = 'the record naming a folder that exists'; Env = $null; Record = ($fuse + "`n"); Version = '0.0.2'; Seen = $fuse },
+                @{ Name = 'the record naming a folder that does not'; Env = $null; Record = ((Join-Path $script:T.Home '.claude-gone') + "`n"); Version = '0.0.1'; Seen = 'unset' },
+                @{ Name = 'an empty record'; Env = $null; Record = ''; Version = '0.0.1'; Seen = 'unset' },
+                @{ Name = 'env set, a record too'; Env = $elsewhere; Record = ($fuse + "`n"); Version = '0.0.3'; Seen = $elsewhere }
+            )
+            foreach ($case in $cases) {
+                Reset-Fake
+                Remove-Item -LiteralPath (Join-Path $script:T.Home '.fuse') -Recurse -Force -ErrorAction SilentlyContinue
+                if ($null -ne $case.Record) { Set-ConfigRecord $case.Record }
+                Set-Env 'CLAUDE_CONFIG_DIR' $case.Env
+                $r = Invoke-Launcher 'term'
+                $r.Code | Should -Be 0 -Because ($case.Name + ': ' + $r.Err)
+                Get-Record | Should -BeExactly $case.Version -Because ($case.Name + ': the version read from the folder the rule chose')
+                $launches = Get-Launches
+                $launches.Count | Should -Be 1 -Because $case.Name
+                $launches[0].ConfigDir | Should -BeExactly $case.Seen -Because $case.Name
+            }
+        }
+
+        It 'with only the record every claude sees its folder: plugin list, the two update lines, the session (AC3)' {
+            $fuse = Join-Path $script:T.Home '.claude-fuse'
+            Set-InstalledPlugins '0.0.2' $fuse
+            Set-ConfigRecord ($fuse + "`n")
+            Set-Record '0.0.1'
+            Set-Env 'FAKE_PLUGIN_LIST' $script:PluginListPresent
+            foreach ($verb in @('update', 'setup')) {
+                Reset-Fake
+                $r = Invoke-Launcher $verb
+                $r.Code | Should -Be 0 -Because ($verb + ': ' + $r.Err)
+                $launches = Get-Launches
+                $launches.Count | Should -BeGreaterThan 1 -Because $verb
+                foreach ($l in $launches) { $l.ConfigDir | Should -BeExactly $fuse -Because ($verb + ': ' + (Get-Argv $l)) }
+            }
+            Get-Argv (Get-Sessions)[0] | Should -BeExactly (($script:SetupFlags + @($script:PartTwo)) -join ' ') -Because 'setup, part two'
+        }
+
+        It 'with neither, no claude sees the variable and the version is read from ~/.claude (AC3)' {
+            Set-InstalledPlugins '0.0.2'
+            Set-Record '0.0.1'
+            $r = Invoke-Launcher 'update'
+            $r.Code | Should -Be 0 -Because $r.Err
+            foreach ($l in (Get-Launches)) { $l.ConfigDir | Should -BeExactly 'unset' -Because (Get-Argv $l) }
+            Get-Argv (Get-Launches)[-1] | Should -BeExactly (($script:DailyArgv + @($script:KeepCurrentPrompt)) -join ' ')
+            Get-Record | Should -BeExactly '0.0.2'
+        }
+    }
+
     Describe 'T3Surface' {
         # OPX-1890 (docs/spec/2026-10-02-fuse-dm-t3-icon-design.md, ruling J): bare fuse-dm.ps1 and `update` open T3 Code
         # when setup's row 15 configured it - ~/.fuse/dm-setup/t3-ready AND the app found (FUSE_DM_T3_APP when set, else the
@@ -915,12 +998,18 @@ exit $rc
 '@
             $script:OpenerWrapper = Write-Wrapper 'opener' $openerFake
             $script:MovedT3 = ' - re-checking the environment first, then T3 Code opens by itself (threads already open there keep the old version until you start a new one)'
-            $script:MovedTerm = ' - re-checking the environment first, seconds'
+            $script:MovedTerm = ' - re-checking the environment first'   # OPX-2020: `, seconds` dropped
             $script:NoApp = 'fuse-dm: T3 Code is not where setup put it - the terminal session instead; fuse-dm setup puts it back'
             $script:Opening = 'fuse-dm: opening T3 Code'
             $script:UpdateLines = @('plugin marketplace update fuse-internal', 'plugin update deployment-manager@fuse-internal')
             $script:HeadlessArgv = (($script:DailyArgv + @('-p', $script:KeepCurrentPrompt)) -join ' ')
             $script:PassArgv = (($script:DailyArgv + @($script:KeepCurrentPrompt)) -join ' ')
+            # OPX-2020: the quick pass - the bare verb's moved-version pass; `update` keeps $HeadlessArgv
+            $script:QuickPrompt = '/deployment-manager:setup keep-current quick'
+            $script:QuickArgv = (($script:DailyArgv + @('--effort', 'low', '-p', $script:QuickPrompt)) -join ' ')
+            $script:MovedQuick = ' - a quick check first, under a minute; then T3 Code opens by itself (threads already open there keep the old version until you start a new one)'
+            $script:Details = ' - details: ~/.fuse/dm-setup/last-pass.log'
+            $script:NoResult = 'fuse-dm: the quick check left no result - details: ~/.fuse/dm-setup/last-pass.log'
 
             function Set-T3Ready {
                 # a machine row 15 finished on: the app (a temp .exe, through FUSE_DM_T3_APP), the marker, the installed
@@ -965,6 +1054,13 @@ exit $rc
             function Get-OutLines($R) { return ,@($R.Out -split "`r?`n") }
             function Get-LineCount($R, [string]$Line) { return @((Get-OutLines $R) | Where-Object { $_ -eq $Line }).Count }
             function Get-Marker { return [IO.Path]::Combine($script:T.Home, '.fuse', 'dm-setup', 't3-ready') }
+            # OPX-2020: the quick pass's log, its lines (an array even when there is one; empty when there is no file)
+            function Get-PassLogPath { return [IO.Path]::Combine($script:T.Home, '.fuse', 'dm-setup', 'last-pass.log') }
+            function Get-PassLog {
+                $f = Get-PassLogPath
+                if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { return ,@() }
+                return ,@([IO.File]::ReadAllText($f) -split "`r?`n" | Where-Object { $_ -ne '' })
+            }
         }
 
         It 'ready and unchanged: the opener, and no claude process at all (AC1, AC8)' {
@@ -981,28 +1077,29 @@ exit $rc
             Get-Record | Should -BeExactly '0.0.2'
         }
 
-        It 'moved: a headless -p keep-current pass, the record, then the opener (AC3)' {
+        It 'moved: the headless pass - the quick one since OPX-2020 - the record, then the opener (AC3)' {
             Set-T3Ready -Record '0.0.1' | Out-Null
             $r = Invoke-Launcher
             $r.Code | Should -Be 0 -Because $r.Err
             $s = Get-Sessions
             $s.Count | Should -Be 1 -Because ($r.Out + $r.Err)
-            Get-Argv $s[0] | Should -BeExactly $script:HeadlessArgv -Because 'the daily argv, -p right before the prompt, the prompt last'
+            Get-Argv $s[0] | Should -BeExactly $script:QuickArgv -Because 'the daily argv, --effort low, -p right before the quick prompt, the prompt last'
             Get-Record | Should -BeExactly '0.0.2'
             $o = Get-Openers
             $o.Count | Should -Be 1
             $o[0].ClaudeCalls | Should -BeExactly '1' -Because 'the opener runs after the pass'
             $o[0].Record | Should -BeExactly '0.0.2' -Because 'and after the record'
-            Get-LineCount $r ('fuse-dm: the plugin moved to 0.0.2' + $script:MovedT3) | Should -Be 1 -Because $r.Out
-            $r.Out | Should -Not -BeLike ('*' + $script:MovedTerm + '*')
+            Get-LineCount $r ('fuse-dm: the plugin moved to 0.0.2' + $script:MovedQuick) | Should -Be 1 -Because $r.Out
+            Get-LineCount $r ('fuse-dm: the plugin moved to 0.0.2' + $script:MovedT3) | Should -Be 0 -Because 'update''s line'
+            Get-LineCount $r ('fuse-dm: the plugin moved to 0.0.2' + $script:MovedTerm) | Should -Be 0 -Because 'term''s line'
         }
 
-        It 'a failed pass: no T3 Code, the console session on the prompt, its code (ruling G)' {
+        It 'a failed pass on update: no T3 Code, the console session on the prompt, its code (ruling G, update''s alone since OPX-2020)' {
             foreach ($case in @(@{ Exits = '3,0'; Code = 0; Record = '0.0.2' }, @{ Exits = '3,5'; Code = 5; Record = '0.0.1' })) {
                 Reset-Fake
                 Set-T3Ready -Record '0.0.1' | Out-Null
                 Set-Env 'FAKE_CLAUDE_EXIT' $case.Exits
-                $r = Invoke-Launcher
+                $r = Invoke-Launcher 'update'
                 $why = 'FAKE_CLAUDE_EXIT=' + $case.Exits
                 $r.Code | Should -Be $case.Code -Because ($why + ': ' + $r.Err)
                 (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:HeadlessArgv + '|' + $script:PassArgv) -Because $why
@@ -1012,11 +1109,11 @@ exit $rc
             }
         }
 
-        It 'a refused model on the pass: the one opus retry keeps -p (Review Focus 4)' {
+        It 'a refused model on update''s full pass: the one opus retry keeps -p (Review Focus 4)' {
             Set-T3Ready -Record '0.0.1' | Out-Null
             Set-Env 'FAKE_CLAUDE_EXIT' '1,0'
             Set-Env 'FAKE_CLAUDE_STDERR' $script:Refusal
-            $r = Invoke-Launcher
+            $r = Invoke-Launcher 'update'
             $r.Code | Should -Be 0 -Because $r.Err
             (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:HeadlessArgv + '|' + ('--model opus --permission-mode auto -p ' + $script:KeepCurrentPrompt))
             Get-Record | Should -BeExactly '0.0.2'
@@ -1171,6 +1268,130 @@ exit $rc
             }
             foreach ($bad in @('osascript', '(Alpha)', 'Stop-Process', 'taskkill')) { $text.Contains($bad) | Should -BeFalse -Because $bad }
         }
+
+        Context 'QuickPass' {
+            # OPX-2020 (docs/spec/2026-10-06-opx-2020-quick-icon-pass-design.md, decisions A, E, F, H): a moved version on the
+            # bare verb's T3 Code path runs setup's quick case - the daily argv plus --effort low, -p right before
+            # '/deployment-manager:setup keep-current quick' - with the same opus retry keeping every flag; `update` keeps
+            # today's full pass, its output in the console, no log. Mirrors test_launcher.py's QuickPass.
+
+            It 'the bare verb sends the quick prompt: --effort low, -p, the prompt last (AC2)' {
+                Set-T3Ready -Record '0.0.1' | Out-Null
+                $r = Invoke-Launcher
+                $r.Code | Should -Be 0 -Because $r.Err
+                $s = Get-Sessions
+                $s.Count | Should -Be 1 -Because ($r.Out + $r.Err)
+                Get-Argv $s[0] | Should -BeExactly $script:QuickArgv
+                Get-Record | Should -BeExactly '0.0.2'
+                $o = Get-Openers
+                $o.Count | Should -Be 1
+                $o[0].ClaudeCalls | Should -BeExactly '1' -Because 'T3 Code opens after the pass'
+            }
+
+            It 'update keeps the full pass: no quick prompt, no --effort, its output in the console, no log (decision F)' {
+                Set-T3Ready -Record '0.0.1' | Out-Null
+                Set-Env 'FAKE_CLAUDE_STDOUT' 'RESULT: OK - the full pass''s own report.'
+                $r = Invoke-Launcher 'update'
+                $r.Code | Should -Be 0 -Because $r.Err
+                (@((Get-Launches) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly (($script:UpdateLines + @($script:HeadlessArgv)) -join '|')
+                Get-Argv (Get-Sessions)[0] | Should -Not -BeLike '*--effort*'
+                Get-LineCount $r ('fuse-dm: the plugin moved to 0.0.2' + $script:MovedT3) | Should -Be 1 -Because $r.Out
+                Get-LineCount $r 'RESULT: OK - the full pass''s own report.' | Should -Be 1 -Because 'the full pass''s output stays in the console'
+                Test-Path -LiteralPath (Get-PassLogPath) | Should -BeFalse -Because 'last-pass.log is the quick pass''s'
+                Get-Record | Should -BeExactly '0.0.2'
+            }
+
+            It 'a refused model on the quick pass: the one opus retry keeps --effort low, -p and the prompt (Review Focus 4)' {
+                Set-T3Ready -Record '0.0.1' | Out-Null
+                Set-Env 'FAKE_CLAUDE_EXIT' '1,0'
+                Set-Env 'FAKE_CLAUDE_STDERR' $script:Refusal
+                $r = Invoke-Launcher
+                $r.Code | Should -Be 0 -Because $r.Err
+                (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly ($script:QuickArgv + '|' + ('--model opus --permission-mode auto --effort low -p ' + $script:QuickPrompt))
+                Get-Record | Should -BeExactly '0.0.2'
+                (Get-Openers).Count | Should -Be 1
+                $log = Get-PassLog
+                $log[0] | Should -BeExactly 'fuse-dm: quick check for deployment-manager 0.0.2' -Because 'headed once, before the first attempt'
+                @($log | Where-Object { $_ -eq $script:Refusal }).Count | Should -Be 1 -Because 'the refusal lands in the log'
+            }
+        }
+
+        Context 'QuickResult' {
+            # OPX-2020 (decisions C, D, H; AC5, AC7): the quick pass's stdout and stderr land in
+            # ~/.fuse/dm-setup/last-pass.log after its header line; the console shows the log's first three RESULT: lines,
+            # the prefix swapped for `fuse-dm: `, the last naming the log - or the no-result line, or the stopped line after
+            # a failed pass; then the hold (FUSE_DM_HOLD, 0 in this suite), the record after a clean pass only, the opener.
+            # Mirrors test_launcher.py's QuickResult; the hold's default and its garbage values are text pins there (Parity).
+
+            It 'the log holds the header line, then the pass''s stdout; the console shows none of it (AC5)' {
+                Set-T3Ready -Record '0.0.1' | Out-Null
+                $stdout = @('Version: deployment-manager 0.0.2 - setup', 'ROW 2 ok - git, gh', 'RESULT: OK - nothing missing for deployment-manager 0.0.2.')
+                Set-Env 'FAKE_CLAUDE_STDOUT' ($stdout -join "`n")
+                $r = Invoke-Launcher
+                $r.Code | Should -Be 0 -Because $r.Err
+                $log = Get-PassLog
+                ($log -join '|') | Should -BeExactly ((@('fuse-dm: quick check for deployment-manager 0.0.2') + $stdout) -join '|')
+                $r.Out | Should -Not -BeLike '*ROW 2*'
+                $r.Out | Should -Not -BeLike '*Version:*'
+            }
+
+            It 'the console shows the first three RESULT lines, cleaned, the last naming the log (AC5)' {
+                Set-T3Ready -Record '0.0.1' | Out-Null
+                $stdout = @('ROW 2 missing - gh is not signed in', '```RESULT: still missing: GitHub sign-in - fuse-dm setup fixes it.',
+                    '- RESULT: fixed here: the launcher and the Desktop icon.', 'RESULT: three.', 'RESULT: four.', 'RESULT: five.')
+                Set-Env 'FAKE_CLAUDE_STDOUT' ($stdout -join "`n")
+                $r = Invoke-Launcher
+                $r.Code | Should -Be 0 -Because $r.Err
+                $want = @(('fuse-dm: the plugin moved to 0.0.2' + $script:MovedQuick),
+                    'fuse-dm: still missing: GitHub sign-in - fuse-dm setup fixes it.',
+                    'fuse-dm: fixed here: the launcher and the Desktop icon.',
+                    ('fuse-dm: three.' + $script:Details),
+                    $script:Opening)
+                $seen = @((Get-OutLines $r) | Where-Object { $_ -ne '' })
+                ($seen -join '|') | Should -BeExactly ($want -join '|') -Because ($r.Out + $r.Err)
+            }
+
+            It 'no RESULT line: the fallback line, then T3 Code, the record written (AC5)' {
+                Set-T3Ready -Record '0.0.1' | Out-Null
+                Set-Env 'FAKE_CLAUDE_STDOUT' 'ROW 2 ok - git, gh'
+                $r = Invoke-Launcher
+                $r.Code | Should -Be 0 -Because $r.Err
+                Get-LineCount $r $script:NoResult | Should -Be 1 -Because $r.Out
+                Get-LineCount $r $script:Opening | Should -Be 1
+                (Get-Openers).Count | Should -Be 1
+                Get-Record | Should -BeExactly '0.0.2'
+            }
+
+            It 'a failed quick pass: the stopped line, T3 Code anyway, nothing recorded (decision D)' {
+                Set-T3Ready -Record '0.0.1' | Out-Null
+                Set-Env 'FAKE_CLAUDE_EXIT' '3'
+                Set-Env 'FAKE_CLAUDE_STDERR' 'Error: something else broke'
+                $r = Invoke-Launcher
+                $r.Code | Should -Be 0 -Because ($r.Out + $r.Err)
+                (@((Get-Sessions) | ForEach-Object { Get-Argv $_ }) -join '|') | Should -BeExactly $script:QuickArgv -Because 'one session: no console session after it'
+                Get-LineCount $r 'fuse-dm: the quick check stopped (exit 3) - fuse-dm setup runs the full check; details: ~/.fuse/dm-setup/last-pass.log' | Should -Be 1 -Because ($r.Out + $r.Err)
+                Get-LineCount $r $script:Opening | Should -Be 1
+                (Get-Openers).Count | Should -Be 1
+                Get-Record | Should -BeExactly '0.0.1' -Because 'the next launch runs the quick check again'
+                @((Get-PassLog) | Where-Object { $_ -eq 'Error: something else broke' }).Count | Should -Be 1 -Because 'stderr lands in the log'
+                ($r.Out + $r.Err) | Should -Not -BeLike '*something else broke*' -Because 'and never in the console'
+            }
+
+            It 'FUSE_DM_HOLD=0: the run ends without the hold (AC5, AC7)' {
+                # the default hold alone is 10 s: a bound under it proves the seam. The plan's 5 s is widened to 9 s for
+                # windows-latest, where each case starts three cold powershell.exe processes (the launcher, the fake claude
+                # through its .cmd, the opener through its .cmd)
+                Set-T3Ready -Record '0.0.1' | Out-Null
+                Set-Env 'FAKE_CLAUDE_STDOUT' 'RESULT: OK - nothing missing for deployment-manager 0.0.2.'
+                $clock = [Diagnostics.Stopwatch]::StartNew()
+                $r = Invoke-Launcher
+                $clock.Stop()
+                $r.Code | Should -Be 0 -Because $r.Err
+                Get-LineCount $r ('fuse-dm: OK - nothing missing for deployment-manager 0.0.2.' + $script:Details) | Should -Be 1 -Because $r.Out
+                (Get-Openers).Count | Should -Be 1
+                $clock.Elapsed.TotalSeconds | Should -BeLessThan 9 -Because 'FUSE_DM_HOLD=0 holds nothing'
+            }
+        }
     }
 
     Describe 'GitForWindows' {
@@ -1277,7 +1498,8 @@ exit $rc
             $text.Contains('2>&1') | Should -BeFalse
             $text | Should -BeLike '*-NoNewWindow*'
             $text | Should -BeLike '*-RedirectStandardError*'
-            $text.Contains('-RedirectStandardOutput') | Should -BeFalse -Because 'the TUI owns stdout'
+            # OPX-2020: the quick pass alone sends its stdout to a file (then into last-pass.log); every TUI session keeps it
+            ([regex]::Matches($text, '-RedirectStandardOutput')).Count | Should -Be 1 -Because 'the TUI owns stdout: only the quick pass redirects it'
         }
 
         It 'exits only in the file-run tail, guarded by $PSCommandPath' {

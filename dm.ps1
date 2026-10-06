@@ -16,7 +16,15 @@
 # T3 Code (OPX-1890, ruling J; the opener Unverified on Windows until a Windows run): ready = ~/.fuse/dm-setup/t3-ready
 # (setup's row 15 writes it; only read here) AND the app found - FUSE_DM_T3_APP when set (the only place looked at),
 # else the first T3 Code*.exe in $env:LOCALAPPDATA\Programs\t3code (winget's per-user folder, Axel's status 10-05; the
-# glob, never the product's name). Ready -> a moved version runs the keep-current pass headless (-p right before the
+# glob, never the product's name). Ready -> a moved version on the bare verb runs setup's quick check (OPX-2020): the
+# daily argv with --effort low and -p right before "/deployment-manager:setup keep-current quick", stdin from an empty
+# file, the same opus retry keeping every flag; its stdout and stderr go to files, appended after it ends to
+# ~/.fuse/dm-setup/last-pass.log (truncated first, one header line; a log that cannot be written never stops it). The
+# console shows none of it: the log's first three RESULT: lines (leading decoration and the prefix swapped for
+# `fuse-dm: `, the last naming the log), or the no-result line, or after a failed check the stopped line; then the hold
+# (Start-Sleep FUSE_DM_HOLD when it is all digits, else 10; no key read), the record after a clean check only, and the
+# opener - a failed quick check opens T3 Code anyway (ruling G is update's alone). Unverified on Windows until a Windows
+# run: the hold and the log under Start-Process. `update` keeps the full keep-current pass headless (-p right before the
 # prompt, stdin from an empty file, the same opus retry); it failing -> the console session on that prompt instead. Then
 # the record, then the opener: Start-Process -FilePath <exe> (FUSE_DM_OPENER replaces it) with
 # T3CODE_TELEMETRY_ENABLED=false set in this process around the call and put back after; it failing -> the console
@@ -24,6 +32,9 @@
 # the console session. A running T3 Code is never restarted or stopped; nothing here installs it or writes its settings.
 # `install-shim` is NOT here: the shim at ~/.fuse/bin/fuse-dm and
 # the Desktop icon are written by the plugin's bash copy under Git Bash (setup's row 14), and the icon execs that copy.
+# Claude Code's folder (OPX-2024) is bin/fuse-dm's claude-config-dir rule in the same three steps: CLAUDE_CONFIG_DIR, else
+# the folder ~/.fuse/dm-setup/claude-config-dir names (the record that install-shim writes), else ~/.claude; a folder the
+# record decided is set as CLAUDE_CONFIG_DIR for every claude started here, and the console's own value put back after.
 # The same file is published as dm.ps1 in FuseFinance/dm-start: the one line `irm .../dm.ps1 | iex` runs this text in
 # the DM's own PowerShell with no argument and an EMPTY $PSCommandPath (there is no file) - that case is setup, the
 # bash BASH_SOURCE rule. Under iex there is no child process either: the body is a function that returns the code, and
@@ -38,8 +49,8 @@
 # CLAUDE_CODE_GIT_BASH_PATH set IN THIS PROCESS (a winget install never reaches the running shell's PATH, and this
 # PowerShell is the one claude inherits from) - no new window, no PATH refresh, no restart.
 # The session runs through Start-Process -NoNewWindow -Wait with stdin and stdout on the console (claude is a TUI; the
-# headless pass alone reads an empty file) and only stderr captured to a file, for the model-refusal check; never a
-# pipeline on the native call.
+# headless passes read an empty file, and the quick check alone sends its stdout to a file, for the log) and stderr
+# captured to a file, for the model-refusal check; never a pipeline on the native call.
 # Windows PowerShell 5.1 and 7 run the same file: pure 7-bit ASCII (5.1 reads a BOM-less file as cp1252), nothing
 # 7-only, seams as FUSE_DM_* environment only (-Help), no module, no settings file, no default mode.
 # Exit: 0 . 64 usage . 69 a prerequisite is missing . 70 a write failed . else claude's own code.
@@ -63,8 +74,30 @@ if (-not $HomeDir) { $HomeDir = [string]$HOME }
 $RootDir = [IO.Path]::Combine($script:HomeDir, 'Fuse')
 $StateFile = [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'state')   # read only: the bootstrap plugin and setup write it
 $VersionFile = [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'plugin-version')   # the launcher's own: the plugin version it last ran a pass for
-$InstalledPlugins = [IO.Path]::Combine($script:HomeDir, '.claude', 'plugins', 'installed_plugins.json')
+# OPX-2024: CLAUDE_CONFIG_DIR when set (a leading ~ expanded), else the first line of the record when it names a folder
+# that exists, else ~/.claude - bin/fuse-dm's claude-config-dir block, step for step. $ConfigFromRecord: the record decided.
+$ConfigRecord = [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'claude-config-dir')   # read only: install-shim writes it
+$ConfigFromRecord = $false
+function Resolve-ClaudeConfigDir {
+    $dir = [string]$env:CLAUDE_CONFIG_DIR
+    $script:ConfigFromRecord = $false
+    if ((-not $dir) -and (Test-Path -LiteralPath $script:ConfigRecord -PathType Leaf)) {
+        $first = @(Get-Content -LiteralPath $script:ConfigRecord -TotalCount 1)
+        if ($first.Count -gt 0 -and $null -ne $first[0]) { $dir = ([string]$first[0]).Trim() }
+        $script:ConfigFromRecord = $true
+    }
+    if ($dir -eq '~' -or $dir.StartsWith('~/') -or $dir.StartsWith('~\')) { $dir = $script:HomeDir + $dir.Substring(1) }
+    if ($script:ConfigFromRecord -and -not ($dir -and (Test-Path -LiteralPath $dir -PathType Container))) { $dir = '' }
+    if (-not $dir) { $dir = [IO.Path]::Combine($script:HomeDir, '.claude'); $script:ConfigFromRecord = $false }
+    return $dir
+}
+$ClaudeConfigDir = Resolve-ClaudeConfigDir
+$InstalledPlugins = [IO.Path]::Combine($script:ClaudeConfigDir, 'plugins', 'installed_plugins.json')
 $KeepCurrentPrompt = '/deployment-manager:setup keep-current'
+$QuickPrompt = '/deployment-manager:setup keep-current quick'   # OPX-2020: the icon's quick check, setup's quick case
+$PassLog = [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'last-pass.log')   # the quick check's whole output
+$Hold = 10                                      # OPX-2020: FUSE_DM_HOLD when it is all digits, else 10
+if ([string]$env:FUSE_DM_HOLD -match '^\d+$') { try { $Hold = [int]$env:FUSE_DM_HOLD } catch { $Hold = 10 } }
 $T3Marker = [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 't3-ready')   # read only: setup's row 15 (t3_code.py settings) writes it
 $Claude = $null
 $Retried = $false
@@ -72,6 +105,7 @@ $Installed = ''
 $Recorded = ''
 $KeepCurrent = $false
 $OnT3 = $false
+$Quick = $false                                 # OPX-2020: the bare verb's surface (Invoke-Daily) - update keeps the full pass
 $T3App = ''
 
 function Say([string]$Message) { Write-Host ('fuse-dm: ' + $Message) }
@@ -85,15 +119,17 @@ function Show-Help {
         '                not installed, part two (/deployment-manager:setup) when it is; another pass follows when',
         '                ~/.fuse/dm-setup/state says so (bootstrap-done, needs-second-pass); at most three launches',
         '  (none)        the keep-current check, then T3 Code when setup set it up (~/.fuse/dm-setup/t3-ready and the app',
-        '                found) - a moved version is re-checked first in a headless pass (claude -p) that closes by itself,',
-        '                then T3 Code opens; otherwise the term session',
+        '                found) - a moved version gets a quick check first (claude -p, setup''s quick case, under a minute,',
+        '                nothing asked): one to three result lines stay on screen (FUSE_DM_HOLD), its whole output goes to',
+        '                ~/.fuse/dm-setup/last-pass.log, and T3 Code opens even when the check fails; otherwise the term session',
         '  term          the daily session in the console: claude on Fable, auto mode, in ~/Fuse - prompts on, no bypass; when',
         '                the installed deployment-manager version differs from ~/.fuse/dm-setup/plugin-version (the one the last',
-        '                pass ran for), the session opens on /deployment-manager:setup keep-current - every row re-checked,',
-        '                seconds - and the record is rewritten after a clean run; no record yet -> the daily session, the',
-        '                version recorded',
+        '                pass ran for), the session opens on /deployment-manager:setup keep-current - every row re-checked -',
+        '                and the record is rewritten after a clean run; no record yet -> the daily session, the version',
+        '                recorded',
         '  update        claude plugin marketplace update fuse-internal, claude plugin update deployment-manager@fuse-internal,',
-        '                then what the bare verb opens, with the same keep-current check',
+        '                then what the bare verb opens, a moved version re-checked by the full keep-current pass (headless,',
+        '                its output in this console; it failing -> the term session on that pass), not the quick check',
         '  install-shim  not here: the shim at ~/.fuse/bin/fuse-dm and the Desktop icon are written by the plugin''s bash',
         '                copy, under Git Bash (bash "$ROOT/bin/fuse-dm" install-shim)',
         '',
@@ -104,7 +140,9 @@ function Show-Help {
         '              FUSE_DM_GIT_BASH (where Git for Windows'' bash.exe is looked for; default: %ProgramFiles%\Git\bin\bash.exe)',
         '              FUSE_DM_SURFACE (term -> the bare verb and update take the console session, T3 Code ready or not)',
         '              FUSE_DM_T3_APP (the T3 Code app''s path; default: the first T3 Code*.exe in %LOCALAPPDATA%\Programs\t3code)',
-        '              FUSE_DM_OPENER (the command that opens it; default: Start-Process)'
+        '              FUSE_DM_OPENER (the command that opens it; default: Start-Process)',
+        '              FUSE_DM_HOLD (10: how long, in s, the quick check''s result lines stay before T3 Code opens; anything but',
+        '                digits -> 10)'
     )) { Write-Host $line }
 }
 
@@ -135,7 +173,8 @@ function Confirm-GitForWindows {
 # ---- claude, by absolute path: ~/.local/bin first (with a PATHEXT extension on Windows: the official installer writes
 # claude.exe there), then PATH; missing -> the official installer runs here (one line said first), then the resolution
 # again; 69 only when claude is still missing. Never a line for the DM to paste. FUSE_DM_INSTALLER replaces the
-# installer expression (the tests' stub; the real one is never run by a test). ----
+# installer expression (the tests' stub; the real one is never run by a test). Every verb that starts claude comes
+# through here first: a folder the record decided is set now (OPX-2024), so each claude opens the DM's Fuse folder. ----
 function Get-ExecutableExtension {
     $exts = @('')
     if ($env:PATHEXT) { $exts = @($env:PATHEXT.Split(';') | Where-Object { $_ } | ForEach-Object { $_.ToLower() }) }
@@ -151,6 +190,7 @@ function Resolve-Claude {
     return $null
 }
 function Confirm-Claude {
+    if ($script:ConfigFromRecord) { $env:CLAUDE_CONFIG_DIR = $script:ClaudeConfigDir }
     $script:Claude = Resolve-Claude
     if ($script:Claude) { return 0 }
     Say 'installing Claude Code - one minute'
@@ -189,8 +229,8 @@ function Read-State {
 # Get-Content -Raw | ConvertFrom-Json in a try; the entry is an array, its first object's `version`; a missing or
 # malformed file = unknown = ''), the record from ~/.fuse/dm-setup/plugin-version (the launcher's own file: setup
 # rewrites `state` whole, so this is not a second line of it). Different -> $KeepCurrent and one line said (on the
-# T3 Code path, $OnT3, the line that says T3 Code opens after); the record is written only after a clean run, and
-# $Recorded follows it so a second call writes nothing. ----
+# T3 Code path, $OnT3, the line that says T3 Code opens after - the quick check's own on the bare verb, $Quick); the
+# record is written only after a clean run, and $Recorded follows it so a second call writes nothing. ----
 function Get-InstalledVersion {
     if (-not (Test-Path -LiteralPath $script:InstalledPlugins -PathType Leaf)) { return '' }
     try {
@@ -215,10 +255,12 @@ function Test-KeepCurrent {
     $script:Recorded = Read-Record
     if ($script:Recorded -and $script:Recorded -ne $script:Installed) {
         $script:KeepCurrent = $true
-        if ($script:OnT3) {
+        if ($script:OnT3 -and $script:Quick) {
+            Say ('the plugin moved to ' + $script:Installed + ' - a quick check first, under a minute; then T3 Code opens by itself (threads already open there keep the old version until you start a new one)')
+        } elseif ($script:OnT3) {
             Say ('the plugin moved to ' + $script:Installed + ' - re-checking the environment first, then T3 Code opens by itself (threads already open there keep the old version until you start a new one)')
         } else {
-            Say ('the plugin moved to ' + $script:Installed + ' - re-checking the environment first, seconds')
+            Say ('the plugin moved to ' + $script:Installed + ' - re-checking the environment first')
         }
     }
 }
@@ -240,7 +282,9 @@ function Write-Record {
 # (setup's silent case) and the effort pin, set right before the launch and put back right after: under iex they would
 # otherwise leak into the DM's session, and the daily session runs on the seat's effort. `pass` (OPX-1890) is the
 # keep-current pass headless: the daily argv with -p right before the prompt, stdin from an empty file so nothing waits
-# on a stdin that is not a console; it ends by itself, and a refusal retry keeps -p. ----
+# on a stdin that is not a console; it ends by itself, and a refusal retry keeps -p. `quick` (OPX-2020) is the same with
+# --effort low and setup's quick prompt; its stdout and stderr are appended to last-pass.log after each attempt, and its
+# stderr is never printed back: the console shows only the result lines. ----
 function ConvertTo-CommandLineToken([string[]]$Tokens) {
     # Start-Process joins -ArgumentList with spaces and quotes nothing (Windows PowerShell 5.1): a token with a space
     # or a quote is wrapped here so it arrives as one argument; the flags, the prompts and the URL go as they are
@@ -257,6 +301,8 @@ function Start-Session([string]$Kind, [string]$Stage) {
         else { $argv += @('/deployment-manager:setup') }
     } elseif ($Kind -eq 'pass') {
         $argv = @('--model', $script:Model, '--permission-mode', 'auto', '-p', $script:KeepCurrentPrompt)
+    } elseif ($Kind -eq 'quick') {
+        $argv = @('--model', $script:Model, '--permission-mode', 'auto', '--effort', 'low', '-p', $script:QuickPrompt)
     } else {
         $argv = @('--model', $script:Model, '--permission-mode', 'auto')
         if ($script:KeepCurrent) { $argv += @($script:KeepCurrentPrompt) }   # setup's keep-current pass, the prompt last
@@ -267,12 +313,17 @@ function Start-Session([string]$Kind, [string]$Stage) {
     }
     $errf = [IO.Path]::Combine([IO.Path]::GetTempPath(), 'fuse-dm.' + $PID + '.err')
     $inf = [IO.Path]::Combine([IO.Path]::GetTempPath(), 'fuse-dm.' + $PID + '.in')
+    $outf = [IO.Path]::Combine([IO.Path]::GetTempPath(), 'fuse-dm.' + $PID + '.out')
     $savedLauncher = $env:FUSE_DM_LAUNCHER
     $savedEffort = $env:CLAUDE_CODE_EFFORT_LEVEL
     $rc = 70
     try {
         if ($Kind -eq 'setup') { $env:FUSE_DM_LAUNCHER = '1'; $env:CLAUDE_CODE_EFFORT_LEVEL = $script:Effort }
-        if ($Kind -eq 'pass') {
+        if ($Kind -eq 'quick') {
+            [IO.File]::WriteAllText($inf, '')
+            $proc = Start-Process -FilePath $script:Claude -ArgumentList (ConvertTo-CommandLineToken $argv) -WorkingDirectory $script:RootDir `
+                -NoNewWindow -Wait -PassThru -RedirectStandardInput $inf -RedirectStandardOutput $outf -RedirectStandardError $errf -ErrorAction Stop
+        } elseif ($Kind -eq 'pass') {
             [IO.File]::WriteAllText($inf, '')
             $proc = Start-Process -FilePath $script:Claude -ArgumentList (ConvertTo-CommandLineToken $argv) -WorkingDirectory $script:RootDir `
                 -NoNewWindow -Wait -PassThru -RedirectStandardInput $inf -RedirectStandardError $errf -ErrorAction Stop
@@ -291,12 +342,17 @@ function Start-Session([string]$Kind, [string]$Stage) {
         }
         if (Test-Path -LiteralPath $inf -PathType Leaf) { Remove-Item -LiteralPath $inf -Force -ErrorAction SilentlyContinue }
     }
+    if ($Kind -eq 'quick') {
+        Add-PassLog $outf                            # stdout, then stderr, after the header and any earlier attempt
+        Add-PassLog $errf
+        if (Test-Path -LiteralPath $outf -PathType Leaf) { Remove-Item -LiteralPath $outf -Force -ErrorAction SilentlyContinue }
+    }
     $err = ''
     if (Test-Path -LiteralPath $errf -PathType Leaf) {
         $err = [IO.File]::ReadAllText($errf)
         Remove-Item -LiteralPath $errf -Force -ErrorAction SilentlyContinue
     }
-    if ($rc -ne 0 -and $err) { [Console]::Error.Write($err) }
+    if ($rc -ne 0 -and $err -and $Kind -ne 'quick') { [Console]::Error.Write($err) }   # the quick check's is in the log
     if ($rc -ne 0 -and (-not $script:Retried) -and ($script:Model -ne $script:RetryModel) -and $err.Contains($script:Model)) {
         $script:Retried = $true
         Say ('this seat refused the model ' + $script:Model + ' - starting again on ' + $script:RetryModel)
@@ -380,6 +436,43 @@ function Open-T3 {
     return $rc
 }
 
+# ---- the quick check (OPX-2020): last-pass.log truncated and headed once, before the first attempt (a retry appends);
+# its result lines read back from the log; a log that cannot be written or read is skipped, never a stop ----
+function Add-PassLog([string]$File) {
+    # the file's bytes appended to the log as claude wrote them, a newline added when they lack a last one
+    if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { return }
+    try {
+        $bytes = [IO.File]::ReadAllBytes($File)
+        if ($bytes.Length -eq 0) { return }
+        $stream = [IO.File]::Open($script:PassLog, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            if ($bytes[$bytes.Length - 1] -ne 10) { $stream.WriteByte(10) }
+        } finally { $stream.Close() }
+    } catch { }
+}
+function Start-QuickPass {
+    try {
+        $dir = Split-Path -Parent $script:PassLog
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+        [IO.File]::WriteAllText($script:PassLog, 'fuse-dm: quick check for deployment-manager ' + $script:Installed + "`n")
+    } catch { }
+    return (Start-Session 'quick' '')
+}
+function Show-Result {
+    # the log's first three lines that start RESULT: after any decoration (spaces, >, *, -, backticks), each said with
+    # the decoration and the prefix cut, the last naming the log; none, or no log -> the no-result line
+    $lines = @()
+    try { if (Test-Path -LiteralPath $script:PassLog -PathType Leaf) { $lines = @([IO.File]::ReadAllLines($script:PassLog)) } } catch { }
+    $found = @($lines | Where-Object { $_ -match '^[\s>*`-]*RESULT:' } | Select-Object -First 3)
+    if ($found.Count -eq 0) { Say 'the quick check left no result - details: ~/.fuse/dm-setup/last-pass.log'; return }
+    for ($i = 0; $i -lt $found.Count; $i++) {
+        $line = $found[$i] -replace '^[\s>*`-]*RESULT:\s*', ''
+        if ($i -eq $found.Count - 1) { $line = $line + ' - details: ~/.fuse/dm-setup/last-pass.log' }
+        Say $line
+    }
+}
+
 # ---- the console session (`term`, and every fallback): the keep-current check before the launch, the record after a
 # clean run ----
 function Invoke-TermSession {
@@ -389,13 +482,24 @@ function Invoke-TermSession {
     return $rc
 }
 # ---- the surface, after Confirm-Claude (and update's two lines): FUSE_DM_SURFACE=term or not ready -> the console
-# session; ready -> the keep-current check, a moved version's headless pass, the record, then T3 Code ----
+# session; ready -> the keep-current check, a moved version's headless pass (the bare verb's quick check, its result
+# lines and the hold; update's full pass), the record, then T3 Code ----
 function Invoke-Surface {
     if ((Get-FuseDmSetting 'FUSE_DM_SURFACE' '') -eq 'term') { return (Invoke-TermSession) }
     if (-not (Test-T3Ready)) { return (Invoke-TermSession) }
     $script:OnT3 = $true
     Test-KeepCurrent
-    if ($script:KeepCurrent) {
+    $clean = $true
+    if ($script:KeepCurrent -and $script:Quick) {
+        # decision D: a failed quick check is one line, nothing recorded (the next launch checks again), T3 Code anyway
+        $rc = Start-QuickPass
+        if ($rc -eq 0) { Show-Result }
+        else {
+            $clean = $false
+            Say ('the quick check stopped (exit ' + $rc + ') - fuse-dm setup runs the full check; details: ~/.fuse/dm-setup/last-pass.log')
+        }
+        try { Start-Sleep -Seconds $script:Hold } catch { }   # the hold: no key read
+    } elseif ($script:KeepCurrent) {
         $rc = Start-Session 'pass' ''
         if ($rc -ne 0) {
             # ruling G: nothing recorded; the pass again, interactive, in the console
@@ -405,7 +509,7 @@ function Invoke-Surface {
             return $rc
         }
     }
-    Write-Record                                     # after the clean pass, or no record yet (ruling I) - before the opener
+    if ($clean) { Write-Record }                     # after the clean pass, or no record yet (ruling I) - before the opener
     $orc = Open-T3
     if ($orc -ne 0) {
         Say ('T3 Code did not open (exit ' + $orc + ') - the terminal session instead')
@@ -425,6 +529,7 @@ function Invoke-Term {
 function Invoke-Daily {
     $code = Confirm-Claude
     if ($code -ne 0) { return $code }
+    $script:Quick = $true                            # OPX-2020, decision F: the bare verb alone gets the quick check
     return (Invoke-Surface)
 }
 function Invoke-Update {
@@ -466,5 +571,7 @@ function Invoke-FuseDm([string]$Verb, [bool]$WantHelp, [bool]$FromFile) {
     return (Die ('unknown verb ' + $Verb) 64)
 }
 
+$fuseDmConfigDir = $env:CLAUDE_CONFIG_DIR   # OPX-2024: Confirm-Claude may set it; under iex the console gets its own back
 $fuseDmExitCode = Invoke-FuseDm -Verb $Verb -WantHelp ([bool]$Help) -FromFile ([bool]$PSCommandPath)
+$env:CLAUDE_CONFIG_DIR = $fuseDmConfigDir
 if ($PSCommandPath) { exit $fuseDmExitCode }

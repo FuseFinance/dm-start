@@ -5,7 +5,9 @@ $FAKE_DIR/launch.<n> (argv0, one arg= line per argument, the cwd, the env it saw
 not, the /dev/tty alias device or not, OPX-1373; /dev/null or not, OPX-1890), answers `plugin list` from
 $FAKE_PLUGIN_LIST, writes the state file when FAKE_CLAUDE_WRITE_STATE tells it to (the nth comma-separated value on the
 nth session launch) and exits with FAKE_CLAUDE_EXIT's nth value, FAKE_CLAUDE_STDERR on stderr — so the relaunch loop,
-the stage choice and the opus retry are all driven from the outside. The real `claude` is never executed.
+the stage choice and the opus retry are all driven from the outside. OPX-2020: every session call also prints
+FAKE_CLAUDE_STDOUT on stdout (the quick pass's reply), and the T3 Code classes swap `sleep` (the hold) for a fake that
+records its argv and returns at once. The real `claude` is never executed.
 
 Run: python3 deployment-manager/setup/tests/test_launcher.py
 """
@@ -52,13 +54,27 @@ PART_ONE_PROMPT = "/fuse-start:begin"
 PART_TWO_PROMPT = "/deployment-manager:setup"
 # OPX-1366 (S-6): the keep-current pass — setup's second pass, opened by the daily launch when the plugin version moved
 KEEP_CURRENT_PROMPT = "/deployment-manager:setup keep-current"
+# OPX-2020: the icon's quick pass — setup's quick case, the bare verb's moved-version pass on the T3 Code path (`update`
+# keeps the full pass above): the daily argv plus `--effort low`, `-p` right before the prompt; its stdout and stderr go
+# to the log, its RESULT: lines to the window, then the hold
+QUICK_PROMPT = "/deployment-manager:setup keep-current quick"
+QUICK_ARGV = DAILY_ARGV + ["--effort", "low", "-p", QUICK_PROMPT]
+PASS_LOG = Path(".fuse") / "dm-setup" / "last-pass.log"
 STATE = Path(".fuse") / "dm-setup" / "state"
 RECORD = Path(".fuse") / "dm-setup" / "plugin-version"       # the launcher's own file: the version it last ran a pass for
 INSTALLED_PLUGINS = Path(".claude") / "plugins" / "installed_plugins.json"
 SHIM = Path(".fuse") / "bin" / "fuse-dm"
+# OPX-2024: Claude Code's own folder is one rule in four copies — bin/fuse-dm's function, the shim body it writes,
+# bin/fuse-live and the sync launcher — between these two marker lines, byte for byte: CLAUDE_CONFIG_DIR when set (a leading ~
+# expanded), else the folder the record install-shim writes names (when it exists), else ~/.claude.
+CONFIG_RECORD = Path(".fuse") / "dm-setup" / "claude-config-dir"
+BLOCK = re.compile(r"(?ms)^# >>> claude-config-dir\b.*?^# <<< claude-config-dir$")
+FUSE_LIVE = PLUGIN_DIR / "bin" / "fuse-live"     # absent from the public tree (dm-start): their pins skip there
+FUSE_SYNC = PLUGIN_DIR / "bin" / ("fuse" + "-sync")   # built from two literals: the published tree never names it (Privacy scan)
+FUSE_FOLDER = ".claude-fuse"                     # a DM's second Claude folder, beside a personal ~/.claude (Roberto's Mac)
 # The externals the script may call (`bash` is what the shim execs the plugin's copy with). Anything else is a
 # `command not found` under the bare PATH — the dependency set is part of the contract (Git Bash ships all of them).
-TOOLS = ("bash", "mkdir", "tee", "awk", "chmod", "rm")
+TOOLS = ("bash", "mkdir", "tee", "awk", "chmod", "rm", "sleep")   # OPX-2020: + sleep, the hold after the quick pass
 
 PLUGIN_LIST_ABSENT = "Installed plugins:\n\n  ❯ slack@claude-plugins-official\n    Version: 1.0.0\n    Scope: user\n    Status: ✔ enabled\n"
 PLUGIN_LIST_PRESENT = PLUGIN_LIST_ABSENT + "\n  ❯ deployment-manager@fuse-internal\n    Version: 0.0.0\n    Scope: user\n    Status: ✔ enabled\n"
@@ -70,6 +86,8 @@ rec="$FAKE_DIR/launch.$n"
 printf 'argv0=%s\n' "$0" > "$rec"
 for a in "$@"; do printf 'arg=%s\n' "$a" >> "$rec"; done
 printf 'cwd=%s\nlauncher=%s\neffort_env=%s\n' "$(pwd -P)" "${FUSE_DM_LAUNCHER:-unset}" "${CLAUDE_CODE_EFFORT_LEVEL:-unset}" >> "$rec"
+# OPX-2024: the Claude folder it was started in — `unset` only when the variable is not in its environment at all
+printf 'config_dir=%s\n' "${CLAUDE_CONFIG_DIR-unset}" >> "$rec"
 # OPX-1373: what stdin is. `-ef` compares device+inode: an fd opened from /dev/tty matches /dev/tty, a dup of the
 # terminal's own fd does not — and the alias device is the one Bun's kqueue refuses.
 printf 'stdin_tty=%s\nstdin_is_dev_tty=%s\n' "$([ -t 0 ] && echo yes || echo no)" "$([ /dev/fd/0 -ef /dev/tty ] && echo yes || echo no)" >> "$rec"
@@ -82,6 +100,8 @@ s=0; [ -f "$FAKE_DIR/sessions" ] && read -r s < "$FAKE_DIR/sessions"; s=$((s+1))
 nth() { v="$1"; i="$2"; while [ "$i" -gt 1 ]; do case "$v" in *,*) v="${v#*,}" ;; *) v="" ;; esac; i=$((i-1)); done; printf '%s' "${v%%,*}"; }
 st="$(nth "${FAKE_CLAUDE_WRITE_STATE:-}" "$s")"
 if [ -n "$st" ]; then mkdir -p "$HOME/.fuse/dm-setup"; printf '%s\n' "$st" > "$HOME/.fuse/dm-setup/state"; fi
+# OPX-2020: what the session prints on stdout (the quick pass's reply), on every session call
+[ -n "${FAKE_CLAUDE_STDOUT:-}" ] && printf '%s\n' "$FAKE_CLAUDE_STDOUT"
 rc="$(nth "${FAKE_CLAUDE_EXIT:-}" "$s")"; [ -n "$rc" ] || rc=0
 [ "$rc" -ne 0 ] && printf '%s\n' "${FAKE_CLAUDE_STDERR:-claude: exit $rc}" >&2
 exit "$rc"
@@ -138,6 +158,19 @@ FAKE_TTY = r'''#!/bin/sh
 if [ -n "${FAKE_NO_TTY:-}" ]; then echo "not a tty"; exit 1; fi
 echo /dev/ttys099
 '''
+FAKE_SLEEP = r'''#!/bin/sh
+# fake sleep (OPX-2020): the hold. Records its argv, the opener and claude calls made before it and the version record at
+# that moment as $FAKE_DIR/sleep.<n>, and sleeps nothing. Only builtins.
+n=0; [ -f "$FAKE_DIR/sleep-count" ] && read -r n < "$FAKE_DIR/sleep-count"; n=$((n+1)); echo "$n" > "$FAKE_DIR/sleep-count"
+rec="$FAKE_DIR/sleep.$n"
+: > "$rec"
+for a in "$@"; do printf 'arg=%s\n' "$a" >> "$rec"; done
+o=0; [ -f "$FAKE_DIR/opener-count" ] && read -r o < "$FAKE_DIR/opener-count"
+c=0; [ -f "$FAKE_DIR/count" ] && read -r c < "$FAKE_DIR/count"
+v=none; [ -f "$HOME/.fuse/dm-setup/plugin-version" ] && read -r v < "$HOME/.fuse/dm-setup/plugin-version"
+printf 'opener_calls=%s\nclaude_calls=%s\nrecord=%s\n' "$o" "$c" "$v" >> "$rec"
+exit 0
+'''
 
 
 class Drive(unittest.TestCase):
@@ -167,7 +200,9 @@ class Drive(unittest.TestCase):
         base = {"HOME": str(self.home), "PATH": str(self.bin), "FAKE_DIR": str(self.fake_dir), "TMPDIR": str(self.tmp),
                 "FAKE_PLUGIN_LIST": PLUGIN_LIST_ABSENT, "FUSE_DM_OSTYPE": "darwin24", "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8",
                 # never the real installer from a test: the no-op stub is the default, a test opts into the installing one
-                "FUSE_DM_INSTALLER": str(self.installer_noop), "FAKE_CLAUDE_BODY": FAKE_CLAUDE}
+                "FUSE_DM_INSTALLER": str(self.installer_noop), "FAKE_CLAUDE_BODY": FAKE_CLAUDE,
+                # OPX-2020: no hold unless a test asks for one (QuickResult drops it to read the default)
+                "FUSE_DM_HOLD": "0"}
         for k, v in extra.items():
             if v is None:
                 base.pop(k, None)
@@ -179,8 +214,8 @@ class Drive(unittest.TestCase):
         return subprocess.run([BASH, str(script or SCRIPT), *args], env=self.env(**extra), capture_output=True, text=True, timeout=60)
 
     def launches(self):
-        """Every invocation of the fake, in order: {argv0, args, cwd, launcher, effort_env, stdin_tty, stdin_is_dev_tty,
-        stdin_is_dev_null}."""
+        """Every invocation of the fake, in order: {argv0, args, cwd, launcher, effort_env, config_dir, stdin_tty,
+        stdin_is_dev_tty, stdin_is_dev_null}."""
         out = []
         for f in sorted(self.fake_dir.glob("launch.*"), key=lambda p: int(p.name.split(".")[1])):
             rec = {"args": []}
@@ -562,11 +597,13 @@ class Shim(Drive):
     `installPath` from installed_plugins.json on EVERY call (a plugin update needs no re-install — not fuse-live's
     copy), and the Desktop icon that runs the shim's plain daily verb."""
 
-    def plugin_copy(self, name):
+    def plugin_copy(self, name, folder=".claude"):
+        """A plugin copy at $TMP/<name>, registered in <HOME>/<folder>/plugins/installed_plugins.json (OPX-2024: the
+        Claude folder is a parameter — ~/.claude, or a DM's second folder)."""
         root = self.tmp / name
         write_exec(root / "bin" / "fuse-dm", FAKE_PLUGIN_COPY)
-        (self.home / ".claude" / "plugins").mkdir(parents=True, exist_ok=True)
-        (self.home / ".claude" / "plugins" / "installed_plugins.json").write_text(json.dumps(
+        (self.home / folder / "plugins").mkdir(parents=True, exist_ok=True)
+        (self.home / folder / "plugins" / "installed_plugins.json").write_text(json.dumps(
             {"version": 2, "plugins": {"deployment-manager@fuse-internal": [{"scope": "user", "installPath": str(root), "version": PLUGIN_VERSION}]}}))
         return root
 
@@ -629,6 +666,128 @@ class Shim(Drive):
         self.assertFalse((self.home / "Desktop" / "Fuse Claude.cmd").exists())
         self.assertIn("Fuse Claude.command", r.stdout)
 
+    # ---- OPX-2024: the record of the Claude folder, the shim that follows it, and `install-shim --check` ----
+    # The shim body as 1.116.67 wrote it: ~/.claude fixed. A machine that ran row 14 before OPX-2024 has this file.
+    OLD_SHIM_BODY = (
+        "#!/usr/bin/env bash\n"
+        "# fuse-dm — the shim. Execs the installed deployment-manager plugin's bin/fuse-dm, resolving the plugin's installPath\n"
+        "# from ~/.claude/plugins/installed_plugins.json on every call, so a plugin update changes nothing here.\n"
+        "root=\"$(awk '/\"deployment-manager@fuse-internal\"/{f=1} f&&/\"installPath\"/{sub(/.*\"installPath\"[[:space:]]*:[[:space:]]*\"/,\"\"); "
+        "sub(/\".*/,\"\"); print; exit}' \"$HOME/.claude/plugins/installed_plugins.json\" 2>/dev/null)\"\n"
+        "root=\"${root//\\\\\\\\//}\"\n"
+        "[ -n \"$root\" ] && [ -f \"$root/bin/fuse-dm\" ] || { echo \"fuse-dm: the deployment-manager plugin is not installed on this computer "
+        "— fuse-dm setup needs it; run the bootstrap first\" >&2; exit 69; }\n"
+        "exec bash \"$root/bin/fuse-dm\" \"$@\"\n")
+
+    def tree(self):
+        """Every path under HOME, with a file's bytes and mtime: what `install-shim --check` must leave as it found it."""
+        return {str(p.relative_to(self.home)): (p.read_bytes(), p.stat().st_mtime_ns) if p.is_file() else None
+                for p in sorted(self.home.rglob("*"))}
+
+    def check(self, **extra):
+        """`install-shim --check`'s exit code, after asserting it wrote nothing, removed nothing and started no claude."""
+        before = self.tree()
+        r = self.run_dm("install-shim", "--check", **extra)
+        self.assertEqual(self.tree(), before, f"--check writes nothing ({extra})")
+        self.assertEqual(self.launches(), [], "--check starts no claude")
+        self.assertEqual(r.stderr, "", "--check answers with its exit code")
+        return r.returncode
+
+    def test_install_shim_writes_the_record_when_the_env_is_set_and_removes_it_when_not(self):
+        """AC2: one line, the absolute folder (`~` expanded), when CLAUDE_CONFIG_DIR is set and non-empty; no record when
+        it is unset or empty; the shim and the icon as today either way."""
+        record = self.home / CONFIG_RECORD
+        r = self.run_dm("install-shim", CLAUDE_CONFIG_DIR="~/" + FUSE_FOLDER)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(record.read_text(), f"{self.home / FUSE_FOLDER}\n", "one line, the folder with ~ expanded")
+        self.assertTrue((self.home / SHIM).is_file())
+        self.assertTrue((self.home / "Desktop" / "Fuse Claude.command").is_file())
+        self.assertIn(str(self.home / FUSE_FOLDER), r.stdout, "the folder is said")
+        r = self.run_dm("install-shim", CLAUDE_CONFIG_DIR=str(self.tmp / "abs"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(record.read_text(), f"{self.tmp / 'abs'}\n", "an absolute folder as it is")
+        for unset in (None, ""):
+            with self.subTest(env="unset" if unset is None else "empty"):
+                record.parent.mkdir(parents=True, exist_ok=True)
+                record.write_text(f"{self.home / FUSE_FOLDER}\n")
+                r = self.run_dm("install-shim", CLAUDE_CONFIG_DIR=unset)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertFalse(record.exists(), "no variable, no record")
+                self.assertTrue((self.home / SHIM).is_file())
+        self.assertEqual(self.launches(), [], "install-shim starts no claude")
+
+    def test_check_is_0_on_a_fresh_install_and_writes_nothing(self):
+        for ostype, icon in (("darwin24", "Fuse Claude.command"), ("msys", "Fuse Claude.cmd")):
+            for env in (None, "~/" + FUSE_FOLDER):
+                with self.subTest(ostype=ostype, env=env):
+                    shutil.rmtree(self.home); self.home.mkdir()
+                    r = self.run_dm("install-shim", FUSE_DM_OSTYPE=ostype, CLAUDE_CONFIG_DIR=env)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertTrue((self.home / "Desktop" / icon).is_file())
+                    self.assertEqual(self.check(FUSE_DM_OSTYPE=ostype, CLAUDE_CONFIG_DIR=env), 0)
+
+    def test_check_is_1_when_the_shim_the_icon_or_the_record_differs(self):
+        """AC2: 1 on a machine with nothing installed, an old-body shim (1.116.67's, ~/.claude fixed), a shim one byte
+        off (the trailing newline: the comparison is byte for byte), a missing icon, and a record that differs from the
+        calling environment — in each case nothing written."""
+        env = "~/" + FUSE_FOLDER
+        self.assertEqual(self.check(CLAUDE_CONFIG_DIR=env), 1, "nothing installed")
+        cases = {
+            "an old-body shim": lambda: (self.home / SHIM).write_text(self.OLD_SHIM_BODY),
+            "a shim without its last newline": lambda: (self.home / SHIM).write_text((self.home / SHIM).read_text()[:-1]),
+            "a missing icon": lambda: (self.home / "Desktop" / "Fuse Claude.command").unlink(),
+            "a record naming another folder": lambda: (self.home / CONFIG_RECORD).write_text(f"{self.home / '.claude-other'}\n"),
+            "no record while the env is set": lambda: (self.home / CONFIG_RECORD).unlink(),
+        }
+        for what, spoil in cases.items():
+            with self.subTest(what=what):
+                shutil.rmtree(self.home); self.home.mkdir()
+                r = self.run_dm("install-shim", CLAUDE_CONFIG_DIR=env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(self.check(CLAUDE_CONFIG_DIR=env), 0, "fresh")
+                spoil()
+                self.assertEqual(self.check(CLAUDE_CONFIG_DIR=env), 1, what)
+        with self.subTest(what="a record while the env is unset"):
+            shutil.rmtree(self.home); self.home.mkdir()
+            self.run_dm("install-shim", CLAUDE_CONFIG_DIR=env)
+            self.assertEqual(self.check(CLAUDE_CONFIG_DIR=None), 1)
+            self.assertEqual(self.check(CLAUDE_CONFIG_DIR=""), 1, "empty is unset")
+
+    def test_install_shim_takes_only_check(self):
+        r = self.run_dm("install-shim", "--frobnicate")
+        self.assertEqual(r.returncode, 64)
+        self.assertIn("usage: fuse-dm", r.stderr)
+        self.assertFalse((self.home / SHIM).exists(), "nothing installed on a usage error")
+
+    def test_help_says_check_and_the_record(self):
+        r = self.run_dm("--help", PATH=str(self.bin))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for token in ("--check", "~/" + CONFIG_RECORD.as_posix(), "CLAUDE_CONFIG_DIR"):
+            with self.subTest(token=token):
+                self.assertIn(token, r.stdout)
+        self.assertIn("--check", SCRIPT.read_text().split("set -u", 1)[0], "the header comment says it")
+
+    def test_shim_follows_the_claude_folder_from_the_env_and_from_the_record(self):
+        """AC (Shim): the plugin registered under ~/.claude-fuse only. The shim execs it with CLAUDE_CONFIG_DIR set, and
+        from the record alone (a stray older ~/.claude install never wins); with neither it exits 69, today's message."""
+        self.run_dm("install-shim")
+        shim = self.home / SHIM
+        fuse = self.plugin_copy("plugin-fuse", folder=FUSE_FOLDER)
+        r = self.run_dm("term", script=shim, CLAUDE_CONFIG_DIR="~/" + FUSE_FOLDER)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.exec_record(), [f"copy={fuse / 'bin' / 'fuse-dm'}", "arg=term"], "from the env")
+        (self.fake_dir / "exec.txt").unlink()
+        r = self.run_dm(script=shim)
+        self.assertEqual(r.returncode, 69, "neither the env nor a record, and no ~/.claude install")
+        self.assertIn("the deployment-manager plugin is not installed on this computer", r.stderr)
+        self.assertEqual(self.exec_record(), [])
+        r = self.run_dm("install-shim", CLAUDE_CONFIG_DIR="~/" + FUSE_FOLDER)    # row 14, in the DM's Fuse session
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.plugin_copy("plugin-stray")                                          # an older copy under ~/.claude
+        r = self.run_dm(script=shim)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.exec_record(), [f"copy={fuse / 'bin' / 'fuse-dm'}"], "from the record, not the stray ~/.claude copy")
+
     def test_windows_icon_opens_git_bash_on_the_shim(self):
         r = self.run_dm("install-shim", FUSE_DM_OSTYPE="msys")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -641,6 +800,163 @@ class Shim(Drive):
         self.assertNotIn("setup", body)
         self.assertFalse((self.home / "Desktop" / "Fuse Claude.command").exists())
         self.assertIn('export PATH="$HOME/.fuse/bin:$PATH"', r.stdout)
+
+
+class ClaudeConfigDir(Drive):
+    """OPX-2024 AC1: one shell rule for Claude Code's own folder — CLAUDE_CONFIG_DIR when set and non-empty (a leading ~
+    expanded), else the folder the record ~/.fuse/dm-setup/claude-config-dir names (its first line, non-empty, an
+    existing folder), else ~/.claude. bin/fuse-dm holds it as a marked function; the shim body it writes, bin/fuse-live
+    and the sync launcher carry the block byte for byte (the PythonResolution idiom: the copies pinned equal, AND each one
+    run). Each copy runs under /bin/bash with a scratch HOME and an EMPTY PATH — the rule is builtins only — and must
+    give the same folder in every case. The block sets CLAUDE_DIR, and CLAUDE_DIR_REC=1 when the record decided it."""
+
+    def copies(self):
+        """{where: block}: fuse-dm's function, the shim install-shim writes, and fuse-live's and the sync launcher's where this
+        tree has them (the public tree, dm-start, has neither)."""
+        own = BLOCK.findall(SCRIPT.read_text())
+        self.assertEqual(len(own), 2, f"{SCRIPT.name}: the function, and its copy in the shim heredoc")
+        r = self.run_dm("install-shim")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        shim = BLOCK.findall((self.home / SHIM).read_text())
+        self.assertEqual(len(shim), 1, "the shim install-shim wrote carries the block once")
+        out = {f"{SCRIPT.name} (the function)": own[0], f"{SCRIPT.name} (the shim heredoc)": own[1], "the installed shim": shim[0]}
+        for f in (FUSE_LIVE, FUSE_SYNC):
+            if f.is_file():
+                found = BLOCK.findall(f.read_text())
+                self.assertEqual(len(found), 1, f"bin/{f.name} carries the block once")
+                out[f"bin/{f.name}"] = found[0]
+        return out
+
+    def resolve(self, block, env, record):
+        """`block`, then `claude_config_dir`, under /bin/bash: HOME a fresh scratch home holding ~/.claude-fuse, PATH an
+        empty folder. `env` None = CLAUDE_CONFIG_DIR not in the environment; `record` None = no record file."""
+        home, empty = self.tmp / "rhome", self.tmp / "empty-path"
+        shutil.rmtree(home, ignore_errors=True)
+        (home / FUSE_FOLDER).mkdir(parents=True)
+        empty.mkdir(exist_ok=True)
+        if record is not None:
+            (home / CONFIG_RECORD).parent.mkdir(parents=True)
+            (home / CONFIG_RECORD).write_text(record)
+        environ = {"HOME": str(home), "PATH": str(empty)}
+        if env is not None:
+            environ["CLAUDE_CONFIG_DIR"] = env
+        r = subprocess.run([BASH, "-c", block + '\nclaude_config_dir\nprintf "%s|%s" "$CLAUDE_DIR" "$CLAUDE_DIR_REC"\n'],
+                           env=environ, capture_output=True, text=True, timeout=30)
+        self.assertEqual((r.returncode, r.stderr), (0, ""), "the rule runs on builtins alone")
+        return tuple(r.stdout.split("|"))
+
+    def cases(self):
+        """(case, CLAUDE_CONFIG_DIR, the record's text, the folder, from the record) — the ticket's seven, then two more:
+        a set variable outranks the record, and an empty one is unset."""
+        h, elsewhere = self.tmp / "rhome", str(self.tmp / "elsewhere")
+        fuse, claude = str(h / FUSE_FOLDER), str(h / ".claude")
+        return (("env unset, no record", None, None, claude, "0"),
+                ("env empty", "", None, claude, "0"),
+                ("env set", elsewhere, None, elsewhere, "0"),
+                ("env with a leading ~", "~/" + FUSE_FOLDER, None, fuse, "0"),
+                ("env unset, the record naming a folder that exists", None, fuse + "\n", fuse, "1"),
+                ("env unset, the record naming a folder that does not", None, str(h / ".claude-gone") + "\n", claude, "0"),
+                ("an empty record", None, "", claude, "0"),
+                ("env set, a record too", elsewhere, fuse + "\n", elsewhere, "0"),
+                ("env empty, the record naming a folder that exists", "", fuse + "\n", fuse, "1"))
+
+    def test_every_copy_gives_the_same_folder_in_every_case(self):
+        for where, block in self.copies().items():
+            for case, env, record, folder, from_record in self.cases():
+                with self.subTest(copy=where, case=case):
+                    self.assertEqual(self.resolve(block, env, record), (folder, from_record))
+
+    def test_the_copies_are_byte_identical(self):
+        copies = self.copies()
+        reference = BLOCK.findall(SCRIPT.read_text())[0]
+        for where, block in copies.items():
+            with self.subTest(copy=where):
+                self.assertEqual(block, reference, f"{where} drifted from bin/fuse-dm's claude-config-dir block")
+        code = "\n".join(l for l in reference.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotRegex(code, r"\b(awk|sed|cat|python3?|cut|head)\b", "no external in the rule")
+
+    @unittest.skipUnless(FUSE_LIVE.is_file() and FUSE_SYNC.is_file(), "no bin/fuse-live or sync launcher beside this copy (the public tree)")
+    def test_fuse_live_and_the_sync_launcher_carry_the_block(self):
+        copies = self.copies()
+        self.assertIn("bin/fuse-live", copies)
+        self.assertIn(f"bin/{FUSE_SYNC.name}", copies)
+
+
+class ConfigDirLaunch(Drive):
+    """OPX-2024 AC3: fuse-dm with a stubbed claude, the plugin registered under ~/.claude-fuse and no ~/.claude install.
+    With CLAUDE_CONFIG_DIR=~/.claude-fuse, `fuse-dm update` reaches the keep-current check and reads the version there.
+    With only the record, every claude it starts — plugin list, the two update lines, setup, the daily session — sees
+    CLAUDE_CONFIG_DIR set to the record's folder. With neither, none sees the variable at all."""
+
+    OLD, NEW = "0.0.1", "0.0.2"
+    UPDATE_LINES = [["plugin", "marketplace", "update", "fuse-internal"], ["plugin", "update", "deployment-manager@fuse-internal"]]
+
+    def installed(self, version, folder):
+        f = self.home / folder / "plugins" / "installed_plugins.json"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps({"version": 2, "plugins": {"deployment-manager@fuse-internal": [
+            {"scope": "user", "installPath": str(self.tmp / "cache" / version), "version": version, "isLocal": False}]}}, indent=2) + "\n")
+
+    def version_record(self, version):
+        f = self.home / RECORD
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(version + "\n")
+
+    def config_record(self, folder):
+        f = self.home / CONFIG_RECORD
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(f"{folder}\n")
+
+    def recorded(self):
+        f = self.home / RECORD
+        return f.read_text().strip() if f.exists() else None
+
+    def every_verb(self, **extra):
+        """{verb: (rc, launches)} for update, setup (part two), term and the bare verb, each from a fresh fake."""
+        out = {}
+        for verb in (("update",), ("setup",), ("term",), ()):
+            shutil.rmtree(self.fake_dir); self.fake_dir.mkdir()
+            self.version_record(self.OLD)
+            r = self.run_dm(*verb, FAKE_PLUGIN_LIST=PLUGIN_LIST_PRESENT, **extra)
+            out[verb[0] if verb else "daily"] = (r.returncode, r.stderr, self.launches())
+        return out
+
+    def test_update_reads_the_version_from_the_env_folder(self):
+        self.installed(self.NEW, FUSE_FOLDER); self.version_record(self.OLD)
+        r = self.run_dm("update", CLAUDE_CONFIG_DIR="~/" + FUSE_FOLDER)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([l["args"] for l in self.launches()], self.UPDATE_LINES + [DAILY_ARGV + [KEEP_CURRENT_PROMPT]],
+                         "the keep-current check read 0.0.2 from ~/.claude-fuse")
+        self.assertEqual(self.recorded(), self.NEW)
+        self.assertEqual({l["config_dir"] for l in self.launches()}, {"~/" + FUSE_FOLDER}, "a set variable is left as it is")
+
+    def test_the_record_alone_puts_every_claude_in_its_folder(self):
+        self.installed(self.NEW, FUSE_FOLDER)
+        self.config_record(self.home / FUSE_FOLDER)
+        for verb, (rc, err, launches) in self.every_verb().items():
+            with self.subTest(verb=verb):
+                self.assertEqual(rc, 0, err)
+                self.assertTrue(launches)
+                self.assertEqual({l["config_dir"] for l in launches}, {str(self.home / FUSE_FOLDER)})
+                if verb in ("update", "term", "daily"):
+                    self.assertEqual(launches[-1]["args"], DAILY_ARGV + [KEEP_CURRENT_PROMPT], "the version read from the record's folder")
+
+    def test_neither_leaves_the_environment_alone(self):
+        """No variable and no usable record (none; one naming a missing folder): ~/.claude, and no claude sees
+        CLAUDE_CONFIG_DIR."""
+        self.installed(self.NEW, ".claude")
+        for record in (None, self.home / ".claude-gone"):
+            with self.subTest(record=None if record is None else record.name):   # xdist ships subTest kwargs: plain values only
+                if record is None:
+                    (self.home / CONFIG_RECORD).unlink(missing_ok=True)
+                else:
+                    self.config_record(record)
+                for verb, (rc, err, launches) in self.every_verb(CLAUDE_CONFIG_DIR=None).items():
+                    with self.subTest(verb=verb):
+                        self.assertEqual(rc, 0, err)
+                        self.assertEqual({l["config_dir"] for l in launches}, {"unset"})
+                        if verb in ("update", "term", "daily"):
+                            self.assertEqual(launches[-1]["args"], DAILY_ARGV + [KEEP_CURRENT_PROMPT], "the version read from ~/.claude")
 
 
 class KeepCurrent(Drive):
@@ -768,16 +1084,10 @@ class KeepCurrent(Drive):
         self.assertIn("keep-current", SCRIPT.read_text().split("set -u", 1)[0], "the header comment says it")
 
 
-class T3Surface(Drive):
-    """OPX-1890 (docs/spec/2026-10-02-fuse-dm-t3-icon-design.md, rulings A-K): bare `fuse-dm` (the Desktop icon) and
-    `update` open T3 Code when setup's row 15 configured it — ~/.fuse/dm-setup/t3-ready AND the app found — after the
-    keep-current check. Unchanged → no claude process at all, then the opener; moved → a headless keep-current pass (the
-    daily argv with `-p` right before the prompt, stdin from /dev/null, the same refusal retry), the record, then the
-    opener; a failed pass → today's terminal session on the prompt. In macOS Terminal a background `osascript` closes the
-    launcher's own window once its shell has ended (one tab, no process left in it). `term` and FUSE_DM_SURFACE=term are
-    today's session. Each "terminal" case first proves its fixture would open T3 Code (the control, run outside Terminal
-    so no close is in flight), then flips one condition, so no negative assertion is vacuous. Stdin is a pipe here
-    (`input=""`, as under CI), never /dev/null: `stdin_is_dev_null=yes` on a session is the launcher's own redirect."""
+class T3Machine(Drive):
+    """The T3 Code machine (OPX-1890): its fixtures, the fakes' records and the shared strings. No test of its own, so
+    T3Surface and OPX-2020's QuickPass and QuickResult each run only their own cases. Stdin is a pipe here (`input=""`,
+    as under CI), never /dev/null: `stdin_is_dev_null=yes` on a session is the launcher's own redirect."""
 
     OLD, NEW = "0.0.1", "0.0.2"
     REFUSAL = "Error: the model 'fable' is not available on this account"
@@ -785,11 +1095,18 @@ class T3Surface(Drive):
     # the plan's "Shared names and strings", bash spelling, each said through `say`
     MOVED_T3 = ("the plugin moved to {v} — re-checking the environment first, then T3 Code opens by itself (threads already "
                 "open there keep the old version until you start a new one)")
-    MOVED = "the plugin moved to {v} — re-checking the environment first, seconds"
+    MOVED = "the plugin moved to {v} — re-checking the environment first"   # OPX-2020: `term`'s line drops `, seconds`
     NO_APP = "T3 Code is not where setup put it — the terminal session instead; fuse-dm setup puts it back"
     OPEN_FAILED = "T3 Code did not open (exit {rc}) — the terminal session instead"
     PASS_FAILED = "the re-check stopped (exit {rc}) — opening it in the terminal instead"
     OPENING = "opening T3 Code"
+    # OPX-2020 (docs/plans/2026-10-06-opx-2020.md, "Shared names and strings"): the quick pass's lines, bash spelling
+    MOVED_QUICK = ("the plugin moved to {v} — a quick check first, under a minute; then T3 Code opens by itself (threads "
+                   "already open there keep the old version until you start a new one)")
+    DETAILS = " — details: ~/.fuse/dm-setup/last-pass.log"          # the last RESULT line shown carries it
+    NO_RESULT = "the quick check left no result — details: ~/.fuse/dm-setup/last-pass.log"
+    QUICK_FAILED = "the quick check stopped (exit {rc}) — fuse-dm setup runs the full check; details: ~/.fuse/dm-setup/last-pass.log"
+    LOG_HEADER = "fuse-dm: quick check for deployment-manager {v}"   # the log's first line, the installed version
 
     def setUp(self):
         super().setUp()
@@ -898,6 +1215,34 @@ class T3Surface(Drive):
         self.assertEqual(s[0]["stdin_is_dev_null"], "no", "the terminal session keeps the DM's stdin")
         self.assertEqual(self.openers(), [], "T3 Code is not opened")
 
+    # ---- OPX-2020: the hold's fake and the quick pass's log ----
+    def fake_sleep(self):
+        """`sleep` in the stub bin becomes FAKE_SLEEP (write_exec unlinks the link to the real one first: the real binary
+        is never written through), so a hold costs nothing and says what it was asked for."""
+        write_exec(self.bin / "sleep", FAKE_SLEEP)
+
+    def sleeps(self):
+        return self.records("sleep")
+
+    def pass_log(self):
+        """~/.fuse/dm-setup/last-pass.log's lines, or None when there is no such file."""
+        f = self.home / PASS_LOG
+        return f.read_text().splitlines() if f.is_file() else None
+
+
+class T3Surface(T3Machine):
+    """OPX-1890 (docs/spec/2026-10-02-fuse-dm-t3-icon-design.md, rulings A-K): bare `fuse-dm` (the Desktop icon) and
+    `update` open T3 Code when setup's row 15 configured it — ~/.fuse/dm-setup/t3-ready AND the app found — after the
+    keep-current check. Unchanged → no claude process at all, then the opener; moved → a headless keep-current pass (the
+    daily argv with `-p` right before the prompt, stdin from /dev/null, the same refusal retry), the record, then the
+    opener; a failed pass → today's terminal session on the prompt. In macOS Terminal a background `osascript` closes the
+    launcher's own window once its shell has ended (one tab, no process left in it). `term` and FUSE_DM_SURFACE=term are
+    today's session. Each "terminal" case first proves its fixture would open T3 Code (the control, run outside Terminal
+    so no close is in flight), then flips one condition, so no negative assertion is vacuous.
+    OPX-2020 (docs/spec/2026-10-06-opx-2020-quick-icon-pass-design.md, decisions D, F): the bare verb's moved-version
+    pass is now the quick check (QuickPass, QuickResult) and a failed one opens T3 Code anyway; `update` keeps the full
+    headless pass, its refusal retry and ruling G, so those cases here run on `update`."""
+
     # ---- AC1-AC11 ----
     def test_ready_unchanged_opens_t3_starts_no_claude(self):
         """AC1: ready and the version unchanged → no claude process at all (no session, no `plugin list`), the opener
@@ -957,15 +1302,15 @@ class T3Surface(Drive):
         self.assertEqual(self.no_close(), [])
 
     def test_moved_runs_headless_pass_records_then_opens(self):
-        """AC3 + Review Focus 3: moved → the headless pass (the daily argv, `-p` right before the prompt, the prompt last,
-        stdin from /dev/null so a non-tty stdin is never waited on), the record rewritten, THEN the opener; one line,
-        the T3 Code one, said once."""
+        """AC3 + Review Focus 3, OPX-2020: moved → the headless pass, now the quick one (the daily argv, `--effort low`,
+        `-p` right before the quick prompt, the prompt last, stdin from /dev/null so a non-tty stdin is never waited on),
+        the record rewritten, THEN the opener; one line, the quick check's, said once."""
         self.ready(record=self.OLD)
         r = self.run_dm()
         self.assertEqual(r.returncode, 0, r.stderr)
         s = self.sessions()
         self.assertEqual(len(s), 1, r.stdout + r.stderr)
-        self.assertEqual(s[0]["args"], DAILY_ARGV + ["-p", KEEP_CURRENT_PROMPT], "the daily argv, -p, the prompt last")
+        self.assertEqual(s[0]["args"], QUICK_ARGV, "the daily argv, --effort low, -p, the quick prompt last")
         self.assertEqual(s[0]["stdin_is_dev_null"], "yes", "the headless pass reads /dev/null, never the DM's stdin")
         self.assertEqual(Path(s[0]["cwd"]).resolve(), (self.home / "Fuse").resolve())
         self.assertEqual(s[0]["launcher"], "unset", "a daily session: no FUSE_DM_LAUNCHER")
@@ -975,18 +1320,21 @@ class T3Surface(Drive):
         self.assertEqual(len(o), 1)
         self.assertEqual(o[0]["claude_calls"], "1", "the opener runs after the pass")
         self.assertEqual(o[0]["record"], self.NEW, "and after the record")
-        self.assertEqual(self.lines(r).count("fuse-dm: " + self.MOVED_T3.format(v=self.NEW)), 1, r.stdout)
-        self.assertNotIn(self.MOVED.format(v=self.NEW), r.stdout, "the terminal path's line is not this path's")
+        self.assertEqual(self.lines(r).count("fuse-dm: " + self.MOVED_QUICK.format(v=self.NEW)), 1, r.stdout)
+        for other in (self.MOVED_T3, self.MOVED):
+            with self.subTest(line=other[24:60]):
+                self.assertNotIn("fuse-dm: " + other.format(v=self.NEW), self.lines(r), "the full pass's lines are update's and term's")
         self.assertIn("fuse-dm: " + self.OPENING, self.lines(r))
 
     def test_failed_pass_falls_back_to_terminal(self):
-        """Ruling G: the headless pass fails → nothing recorded by it, one line, then today's terminal session on the
-        keep-current prompt (no `-p`, interactive), its record after a clean exit, its exit code; T3 Code not opened."""
+        """Ruling G, `update`'s alone since OPX-2020 (decision D: a failed quick pass opens T3 Code, QuickResult): the full
+        headless pass fails → nothing recorded by it, one line, then today's terminal session on the keep-current prompt
+        (no `-p`, interactive), its record after a clean exit, its exit code; T3 Code not opened."""
         for exits, code, record in (("3,0", 0, self.NEW), ("3,5", 5, self.OLD)):
             with self.subTest(FAKE_CLAUDE_EXIT=exits):
                 self.reset()
                 self.ready(record=self.OLD)
-                r = self.run_dm(FAKE_CLAUDE_EXIT=exits)
+                r = self.run_dm("update", FAKE_CLAUDE_EXIT=exits)
                 self.assertEqual(r.returncode, code, r.stderr)
                 s = self.sessions()
                 self.assertEqual([x["args"] for x in s], [DAILY_ARGV + ["-p", KEEP_CURRENT_PROMPT], DAILY_ARGV + [KEEP_CURRENT_PROMPT]],
@@ -998,10 +1346,11 @@ class T3Surface(Drive):
                 self.assertEqual(self.no_close(), [])
 
     def test_headless_refusal_retry_keeps_p(self):
-        """Review Focus 4: the seat refuses fable on the headless pass → the one opus retry keeps `-p` and the prompt last,
-        stdin still /dev/null; then the record and the opener."""
+        """Review Focus 4, on `update`'s full pass (OPX-2020: the quick pass's retry is QuickPass's): the seat refuses
+        fable on the headless pass → the one opus retry keeps `-p` and the prompt last, stdin still /dev/null; then the
+        record and the opener."""
         self.ready(record=self.OLD)
-        r = self.run_dm(FAKE_CLAUDE_EXIT="1,0", FAKE_CLAUDE_STDERR=self.REFUSAL)
+        r = self.run_dm("update", FAKE_CLAUDE_EXIT="1,0", FAKE_CLAUDE_STDERR=self.REFUSAL)
         self.assertEqual(r.returncode, 0, r.stderr)
         s = self.sessions()
         self.assertEqual([x["args"] for x in s], [DAILY_ARGV + ["-p", KEEP_CURRENT_PROMPT],
@@ -1010,7 +1359,7 @@ class T3Surface(Drive):
         self.assertEqual(self.recorded(), self.NEW)
         o = self.openers()
         self.assertEqual(len(o), 1)
-        self.assertEqual(o[0]["claude_calls"], "2", "after the retry")
+        self.assertEqual(o[0]["claude_calls"], "4", "after the two update lines and the retry")
         self.assertNotIn("the re-check stopped", r.stdout)
 
     def test_app_without_marker_is_terminal(self):
@@ -1268,16 +1617,286 @@ class T3Surface(Drive):
                 self.assertNotIn(bad, text)
 
     def test_t3_path_externals(self):
-        """Spec § The launcher, Externals: the header names `osascript` (macOS Terminal only) and T3 Code; the close is
-        HUP-proof; no `sleep`, `ps`, `pgrep` — the AppleScript's own `delay` waits."""
+        """Spec § The launcher, Externals: the header names `osascript` (macOS Terminal only), T3 Code and (OPX-2020)
+        `sleep`, the hold after the quick pass; the close is HUP-proof; no `ps`, `pgrep` or `killall` — the
+        AppleScript's own `delay` waits for the close."""
         text = SCRIPT.read_text()
         head = text.split("set -u", 1)[0]
-        for needle in ("osascript", "T3 Code", "fuse-dm term"):
+        for needle in ("osascript", "T3 Code", "fuse-dm term", "sleep"):
             with self.subTest(needle=needle):
                 self.assertIn(needle, head)
         self.assertIn("trap '' HUP", text)
-        self.assertNotRegex(text, r"\b(sleep|pgrep|killall)\b")
+        self.assertNotRegex(text, r"\b(pgrep|killall)\b")
         self.assertNotRegex(text, r"(?m)(^|[\s;&|(])ps\s+-", "no ps")
+
+
+class QuickPass(T3Machine):
+    """OPX-2020 (docs/spec/2026-10-06-opx-2020-quick-icon-pass-design.md, decisions A, E, F; AC2, AC3): a moved version
+    on the icon's path — bare `fuse-dm`, T3 Code ready — runs setup's quick case headless: the daily argv plus
+    `--effort low`, `-p` right before `/deployment-manager:setup keep-current quick`, stdin from /dev/null, the one opus
+    retry keeping every flag. `fuse-dm update` keeps today's full pass (its output in the DM's window, no log, no hold);
+    `fuse-dm term` stays today's interactive session. `sleep` is FAKE_SLEEP; no window close is in flight."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_sleep()
+
+    def env(self, **extra):
+        return super().env(**{"TERM_PROGRAM": None, **extra})
+
+    def test_bare_verb_sends_the_quick_prompt(self):
+        """AC2 + AC3: exactly one session, the quick argv, stdin /dev/null; the record, then T3 Code."""
+        self.ready(record=self.OLD)
+        r = self.run_dm()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.sessions()
+        self.assertEqual(len(s), 1, r.stdout + r.stderr)
+        self.assertEqual(s[0]["args"], ["--model", "fable", "--permission-mode", "auto", "--effort", "low", "-p", QUICK_PROMPT])
+        self.assertEqual(s[0]["stdin_is_dev_null"], "yes", "the quick pass reads /dev/null, never the DM's stdin")
+        self.assertEqual(Path(s[0]["cwd"]).resolve(), (self.home / "Fuse").resolve())
+        self.assertEqual(s[0]["launcher"], "unset", "a daily session: no FUSE_DM_LAUNCHER")
+        self.assertEqual(self.recorded(), self.NEW)
+        self.assertEqual([o["claude_calls"] for o in self.openers()], ["1"], "T3 Code opens after the pass")
+
+    def test_update_keeps_the_full_pass(self):
+        """Decision F: `update` on the same machine → today's full headless pass (no `quick`, no `--effort`), MOVED_T3 said,
+        its output in the DM's own window (they typed it, the window stays), no log written, no hold."""
+        self.ready(record=self.OLD)
+        report = "RESULT: OK — the full pass's own report."
+        r = self.run_dm("update", FAKE_CLAUDE_STDOUT=report)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.sessions()
+        self.assertEqual([x["args"] for x in s], [DAILY_ARGV + ["-p", KEEP_CURRENT_PROMPT]], r.stdout + r.stderr)
+        self.assertNotIn("--effort", s[0]["args"])
+        self.assertEqual(self.lines(r).count("fuse-dm: " + self.MOVED_T3.format(v=self.NEW)), 1, r.stdout)
+        self.assertIn(report, self.lines(r), "the full pass's output stays in the DM's window")
+        self.assertIsNone(self.pass_log(), "last-pass.log is the quick pass's")
+        self.assertEqual(self.sleeps(), [], "no hold on update")
+        self.assertEqual(self.recorded(), self.NEW)
+        self.assertEqual(len(self.openers()), 1)
+
+    def test_term_is_today(self):
+        """Decision F: `term` with a moved version → today's interactive session on the keep-current prompt, its moved
+        line without a time claim; no quick pass, no log, no hold, no T3 Code."""
+        self.ready(record=self.OLD)
+        r = self.run_dm("term")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.sessions()
+        self.assertEqual([x["args"] for x in s], [DAILY_ARGV + [KEEP_CURRENT_PROMPT]], r.stdout + r.stderr)
+        self.assertEqual(s[0]["stdin_is_dev_null"], "no", "interactive: the DM's own stdin")
+        self.assertEqual(self.lines(r).count("fuse-dm: " + self.MOVED.format(v=self.NEW)), 1, r.stdout)
+        self.assertEqual(self.openers(), [])
+        self.assertEqual(self.sleeps(), [])
+        self.assertIsNone(self.pass_log())
+
+    def test_refusal_retry_keeps_the_quick_argv(self):
+        """Review Focus 4: the seat refuses fable on the quick pass → the one opus retry keeps `--effort low`, `-p` and the
+        quick prompt last, stdin /dev/null; the log is truncated and headed once, before the first attempt, and keeps the
+        refusal; the window never shows the pass's stderr."""
+        self.ready(record=self.OLD)
+        r = self.run_dm(FAKE_CLAUDE_EXIT="1,0", FAKE_CLAUDE_STDERR=self.REFUSAL)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.sessions()
+        self.assertEqual([x["args"] for x in s],
+                         [QUICK_ARGV, ["--model", "opus", "--permission-mode", "auto", "--effort", "low", "-p", QUICK_PROMPT]])
+        self.assertEqual([x["stdin_is_dev_null"] for x in s], ["yes", "yes"])
+        self.assertEqual(self.recorded(), self.NEW)
+        self.assertEqual([o["claude_calls"] for o in self.openers()], ["2"], "after the retry")
+        self.assertEqual(len([l for l in self.lines(r) if "opus" in l]), 1, "the retry said in one line")
+        log = self.pass_log()
+        self.assertIsNotNone(log, "no ~/.fuse/dm-setup/last-pass.log")
+        self.assertEqual(log[0], self.LOG_HEADER.format(v=self.NEW))
+        self.assertEqual(log.count(self.LOG_HEADER.format(v=self.NEW)), 1, "one header: the retry appends")
+        self.assertIn(self.REFUSAL, log, "the pass's stderr lands in the log")
+        self.assertNotIn(self.REFUSAL, r.stdout + r.stderr, "and never in the window")
+
+
+class QuickResult(T3Machine):
+    """OPX-2020 (decisions C, D; AC5): the quick pass's stdout and stderr go to ~/.fuse/dm-setup/last-pass.log (truncated
+    each pass, its header first); the window then shows the log's first three `RESULT:` lines — leading decoration and
+    the prefix swapped for `fuse-dm: `, the last naming the log — or the no-result line, or after a failed pass the
+    stopped line; then the hold (`sleep` FUSE_DM_HOLD seconds, 10 by default, anything but digits → 10, no key read), the
+    record (clean exit only), the opener, `opening T3 Code`. A failed quick pass opens T3 Code anyway (ruling G stays
+    `update`'s). `sleep` is FAKE_SLEEP; no window close is in flight."""
+
+    STDOUT = ("Version: deployment-manager 0.0.2 · setup", "ROW 2 ok — git, gh",
+              "RESULT: OK — nothing missing for deployment-manager 0.0.2.")
+
+    def setUp(self):
+        super().setUp()
+        self.fake_sleep()
+
+    def env(self, **extra):
+        return super().env(**{"TERM_PROGRAM": None, **extra})
+
+    def moved(self, *args, **extra):
+        """A ready machine one version behind, then one run of the launcher."""
+        self.ready(record=self.OLD)
+        return self.run_dm(*args, **extra)
+
+    def between(self, r):
+        """The window's lines after MOVED_QUICK and before `opening T3 Code` — the result the DM is left with."""
+        lines = self.lines(r)
+        first, last = "fuse-dm: " + self.MOVED_QUICK.format(v=self.NEW), "fuse-dm: " + self.OPENING
+        self.assertIn(first, lines, r.stdout + r.stderr)
+        self.assertIn(last, lines, r.stdout + r.stderr)
+        return lines[lines.index(first) + 1:lines.index(last)]
+
+    def test_log_holds_header_and_stdout(self):
+        """The log: its header line (the installed version), then the pass's stdout as printed; the window shows none of
+        it (stderr lands in the log too: test_failed_pass_opens_t3_anyway)."""
+        r = self.moved(FAKE_CLAUDE_STDOUT="\n".join(self.STDOUT))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.pass_log(), [self.LOG_HEADER.format(v=self.NEW), *self.STDOUT])
+        for leak in ("ROW 2", "Version:"):
+            with self.subTest(leak=leak):
+                self.assertNotIn(leak, r.stdout + r.stderr)
+
+    def test_window_shows_result_lines_and_names_the_log(self):
+        """Two RESULT lines → the window is MOVED_QUICK, those two with `fuse-dm: ` for `RESULT: `, the last naming the
+        log, then `opening T3 Code` — nothing else."""
+        out = ("Version: deployment-manager 0.0.2 · setup", "ROW 2 missing — gh is not signed in", "ROW 14 fixed — install-shim",
+               "RESULT: still missing: GitHub sign-in — fuse-dm setup fixes it.",
+               "RESULT: fixed here: the launcher and the Desktop icon.")
+        r = self.moved(FAKE_CLAUDE_STDOUT="\n".join(out))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.lines(r), ["fuse-dm: " + self.MOVED_QUICK.format(v=self.NEW),
+                                         "fuse-dm: still missing: GitHub sign-in — fuse-dm setup fixes it.",
+                                         "fuse-dm: fixed here: the launcher and the Desktop icon." + self.DETAILS,
+                                         "fuse-dm: " + self.OPENING], r.stdout + r.stderr)
+
+    def test_at_most_three_lines(self):
+        """Five RESULT lines → the first three, the third naming the log."""
+        r = self.moved(FAKE_CLAUDE_STDOUT="\n".join(f"RESULT: {w}." for w in ("one", "two", "three", "four", "five")))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.between(r), ["fuse-dm: one.", "fuse-dm: two.", "fuse-dm: three." + self.DETAILS])
+
+    def test_decorated_result_lines(self):
+        """Review Focus 1: the model wraps its reply in a code fence or a list → the launcher still finds the lines and
+        strips the leading decoration (spaces, `>`, `*`, `-`, backticks)."""
+        r = self.moved(FAKE_CLAUDE_STDOUT="```\nRESULT: OK — a.\n```\n- RESULT: fixed here: b.")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.between(r), ["fuse-dm: OK — a.", "fuse-dm: fixed here: b." + self.DETAILS])
+        for deco in ("  ", "> ", "* ", "- ", "```", "`", "> - "):
+            with self.subTest(decoration=deco):
+                self.reset()
+                r = self.moved(FAKE_CLAUDE_STDOUT=deco + "RESULT: fixed here: c.")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(self.between(r), ["fuse-dm: fixed here: c." + self.DETAILS])
+
+    def test_no_result_line(self):
+        """No RESULT line (or no output at all) → the one fallback line; T3 Code opens; the clean pass is recorded."""
+        for stdout in ("Version: deployment-manager 0.0.2 · setup\nROW 2 ok — git, gh", None):
+            with self.subTest(stdout="some" if stdout else "none"):
+                self.reset()
+                r = self.moved(FAKE_CLAUDE_STDOUT=stdout)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(self.between(r), ["fuse-dm: " + self.NO_RESULT])
+                self.assertEqual(len(self.openers()), 1)
+                self.assertEqual(self.recorded(), self.NEW)
+
+    def test_failed_pass_opens_t3_anyway(self):
+        """Decision D: the quick pass exits non-zero (no retry: not a refusal) → the stopped line with its code, nothing
+        recorded (the next launch runs the quick check again), the hold, then T3 Code — exactly one claude session, never
+        the terminal one; its stderr in the log, never in the window."""
+        broke = "Error: something else broke"
+        r = self.moved(FAKE_CLAUDE_EXIT="3", FAKE_CLAUDE_STDERR=broke)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([x["args"] for x in self.sessions()], [QUICK_ARGV], "one claude session: no terminal session after it")
+        self.assertEqual(self.lines(r), ["fuse-dm: " + self.MOVED_QUICK.format(v=self.NEW),
+                                         "fuse-dm: " + self.QUICK_FAILED.format(rc=3),
+                                         "fuse-dm: " + self.OPENING], r.stdout + r.stderr)
+        self.assertIn(broke, self.pass_log() or [], "the pass's stderr lands in the log")
+        self.assertNotIn(broke, r.stdout + r.stderr)
+        self.assertEqual(self.recorded(), self.OLD, "not recorded: the next launch runs the quick check again")
+        self.assertEqual([o["record"] for o in self.openers()], [self.OLD], "the opener called once, nothing recorded")
+        self.assertEqual(len(self.sleeps()), 1, "the hold still runs")
+
+    def test_hold_before_the_opener(self):
+        """FUSE_DM_HOLD unset → `sleep 10`, once: after the pass, before the record and the opener."""
+        r = self.moved(FUSE_DM_HOLD=None, FAKE_CLAUDE_STDOUT="RESULT: OK — nothing missing for deployment-manager 0.0.2.")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        held = self.sleeps()
+        self.assertEqual([h["args"] for h in held], [["10"]], "one hold, 10 s by default")
+        self.assertEqual(held[0]["claude_calls"], "1", "after the pass")
+        self.assertEqual(held[0]["record"], self.OLD, "before the record")
+        self.assertEqual(held[0]["opener_calls"], "0", "before the opener")
+        self.assertEqual([o["record"] for o in self.openers()], [self.NEW], "then the record, then T3 Code")
+
+    def test_hold_seam_and_garbage(self):
+        """Review Focus 2: FUSE_DM_HOLD digits → that many seconds; anything else (letters, empty, a sign, a point) → 10,
+        never a `sleep` error."""
+        for value, seconds in (("3", "3"), ("abc", "10"), ("", "10"), ("-1", "10"), ("1.5", "10")):
+            with self.subTest(FUSE_DM_HOLD=value):
+                self.reset()
+                r = self.moved(FUSE_DM_HOLD=value)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual([h["args"] for h in self.sleeps()], [[seconds]])
+                self.assertEqual(len(self.openers()), 1)
+
+    def test_no_hold_without_a_pass(self):
+        """An unchanged version is today's path: no pass, no log, no hold, T3 Code at once."""
+        self.ready()
+        r = self.run_dm()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.sessions(), [])
+        self.assertEqual(self.sleeps(), [])
+        self.assertIsNone(self.pass_log())
+        self.assertEqual(len(self.openers()), 1)
+
+    def test_unwritable_log_still_opens(self):
+        """Review Focus 3: the log cannot be written (its path is a directory) → the pass still runs, the no-result or the
+        stopped line is said, T3 Code still opens, exit 0."""
+        self.ready(record=self.OLD)
+        (self.home / PASS_LOG).mkdir(parents=True)
+        r = self.run_dm(FAKE_CLAUDE_STDOUT="RESULT: OK — nothing missing for deployment-manager 0.0.2.")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.sessions()), 1, "the pass still runs")
+        stopped = re.compile(re.escape("fuse-dm: " + self.QUICK_FAILED.format(rc="RC")).replace("RC", r"\d+"))
+        said = self.lines(r)
+        self.assertTrue(("fuse-dm: " + self.NO_RESULT) in said or any(stopped.fullmatch(l) for l in said), r.stdout + r.stderr)
+        self.assertEqual(len(self.openers()), 1, "T3 Code still opens")
+        self.assertIn("fuse-dm: " + self.OPENING, said)
+
+    def test_hold_reads_no_key(self):
+        """The hold reads no key: stdin a pipe closed at once (`input=""`), then a pipe kept open and never written — the
+        run completes both times, and the hold is `sleep`."""
+        self.ready(record=self.OLD)
+        r = self.run_dm()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.sleeps()), 1, "the hold ran")
+        self.reset()
+        self.ready(record=self.OLD)
+        p = subprocess.Popen([BASH, str(SCRIPT)], env=self.env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+        try:
+            code = p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            self.fail("the launcher waited on its stdin (a pipe kept open, never written)")
+        finally:
+            p.stdin.close()
+        out, err = p.stdout.read(), p.stderr.read()
+        p.stdout.close()
+        p.stderr.close()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(self.sleeps()), 1, "the hold ran")
+        self.assertEqual(len(self.openers()), 1)
+
+
+class NoSecondsClaim(Drive):
+    """OPX-2020 AC6, the bash half (the text half is test_skill_contracts.py's NoSecondsClaim): today's pass took 12 min,
+    so the launcher's help claims no seconds for a pass; it names the quick check, its log and the hold's seam — on the
+    bare PATH, no external needed."""
+
+    def test_help_claims_no_seconds_and_names_the_quick_check(self):
+        r = self.run_dm("--help", PATH=str(self.bin))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("seconds", r.stdout)
+        for token in ("last-pass.log", "quick check", "FUSE_DM_HOLD"):
+            with self.subTest(token=token):
+                self.assertIn(token, r.stdout)
 
 
 def bash_line(pattern, where="bin/fuse-dm"):
@@ -1349,6 +1968,7 @@ class Parity(unittest.TestCase):
              $HOME/.fuse/dm-setup/state    ↔ [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'state')
              $HOME/.fuse/dm-setup/plugin-version ↔ [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'plugin-version')   (OPX-1366)
              $HOME/.local/bin/claude       ↔ [IO.Path]::Combine($script:HomeDir, '.local', 'bin', 'claude')
+             $HOME/.fuse/dm-setup/claude-config-dir ↔ [IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'claude-config-dir')   (OPX-2024)
              --permission-mode auto        ↔ '--permission-mode', 'auto'
              ` — ` in a message            ↔ ` - `"""
         bash, text = SCRIPT.read_text(), ps1_text()
@@ -1357,6 +1977,7 @@ class Parity(unittest.TestCase):
             '"$HOME/.fuse/dm-setup/state"': "[IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'state')",
             '"$HOME/.fuse/dm-setup/plugin-version"': "[IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'plugin-version')",
             '"$HOME/.local/bin/claude"': "[IO.Path]::Combine($script:HomeDir, '.local', 'bin', 'claude')",
+            '"$HOME/.fuse/dm-setup/claude-config-dir"': "[IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'claude-config-dir')",
         }
         for bash_spelling, ps1_spelling in table.items():
             with self.subTest(path=bash_spelling):
@@ -1378,7 +1999,7 @@ class Parity(unittest.TestCase):
                         r'\|\| say "(the plugin update did not go through — the session opens on the copy you have; run fuse-dm update again later)"$',
                         r'^\s*say "(installing Claude Code — one minute)"$',
                         r'\|\| say "(the installer did not finish cleanly)"$',
-                        r'^\s*say "the plugin moved to \$INSTALLED( — re-checking the environment first, seconds)"$'):   # OPX-1366
+                        r'^\s*say "the plugin moved to \$INSTALLED( — re-checking the environment first)"$'):   # OPX-1366; OPX-2020: `, seconds` dropped
             fragment = bash_line(pattern)
             with self.subTest(fragment=fragment[:40]):
                 self.assertIn(ascii_dash(fragment), text)
@@ -1428,6 +2049,18 @@ class Parity(unittest.TestCase):
             with self.subTest(shim_only=shim_only):
                 self.assertNotIn(shim_only, text)
         self.assertIn("usage: fuse-dm", text)
+
+    def test_the_claude_folder_rule_is_the_bash_rule(self):
+        """OPX-2024: the ps1 computes $InstalledPlugins from bin/fuse-dm's three steps — CLAUDE_CONFIG_DIR, the record
+        install-shim writes, ~/.claude — and sets $env:CLAUDE_CONFIG_DIR for its claude calls only when the record decided
+        it, as bash exports it (the Pester suite runs the cases); a value of the DM's own console is put back after."""
+        bash, text = SCRIPT.read_text(), ps1_text()
+        self.assertIn('INSTALLED_PLUGINS="$CLAUDE_DIR/plugins/installed_plugins.json"', bash)
+        self.assertIn("$InstalledPlugins = [IO.Path]::Combine($script:ClaudeConfigDir, 'plugins', 'installed_plugins.json')", text)
+        self.assertIn("[IO.Path]::Combine($script:HomeDir, '.claude')", text)
+        self.assertIn('export CLAUDE_CONFIG_DIR="$CLAUDE_DIR"', bash)
+        self.assertIn("$env:CLAUDE_CONFIG_DIR = $script:ClaudeConfigDir", text)
+        self.assertIn("CLAUDE_CONFIG_DIR", text.split("param(", 1)[0], "the header says it")
 
     def test_the_ps1_only_seams_are_named_where_they_belong(self):
         """The Git-for-Windows branch is the ps1's alone: CLAUDE_CODE_GIT_BASH_PATH and the default bash.exe path are
@@ -1524,6 +2157,50 @@ class Parity(unittest.TestCase):
                 self.assertIsNotNone(match, f"bin/fuse-dm: no line matches {pattern!r}")
                 for fragment in match.groups():
                     self.assertIn(ascii_dash(fragment), text)
+
+    def test_quick_pass_literals_match(self):
+        """OPX-2020 (decisions C, E, H): the quick pass, literal for literal — its prompt (byte-identical), its argv
+        (`--effort low` between the permission mode and `-p`), the log in each script's path spelling, and the hold's seam:
+        bash `sleep "$HOLD"`, the ps1 Start-Sleep, FUSE_DM_HOLD taken only when it matches `^\\d+$` (else 10). The ps1's
+        garbage-hold case is this text pin: Pester cannot fake a cmdlet in the child, and the default would cost 10 s."""
+        bash, text = SCRIPT.read_text(), ps1_text()
+        self.assertIn(f'"{QUICK_PROMPT}"', bash)
+        self.assertIn(f"'{QUICK_PROMPT}'", text)
+        self.assertIn('--model "$MODEL" --permission-mode auto --effort low -p "$QUICK_PROMPT"', bash)
+        self.assertIn("'--model', $script:Model, '--permission-mode', 'auto', '--effort', 'low', '-p', $script:QuickPrompt", text)
+        self.assertIn('"$HOME/.fuse/dm-setup/last-pass.log"', bash)
+        self.assertIn("[IO.Path]::Combine($script:HomeDir, '.fuse', 'dm-setup', 'last-pass.log')", text)
+        self.assertIn("FUSE_DM_HOLD", bash)
+        self.assertIn("FUSE_DM_HOLD", text)
+        self.assertIn('sleep "$HOLD"', bash)
+        self.assertIn("Start-Sleep -Seconds", text)
+        self.assertIn(r"'^\d+$'", text, "the ps1 takes FUSE_DM_HOLD only when it is all digits")
+
+    def test_quick_pass_messages_match_with_ascii_dashes(self):
+        """OPX-2020: the quick pass's lines in both scripts — bash with ` — `, the ps1 with ` - ` — by their fixed halves
+        (the version and the exit code are variables): MOVED_QUICK, the log's header, the details suffix, NO_RESULT and
+        QUICK_FAILED; and `term`'s moved line has dropped its `, seconds` in both."""
+        bash, text = SCRIPT.read_text(), ps1_text()
+        fragments = (T3Machine.MOVED_QUICK.split("{v}", 1)[1], T3Machine.LOG_HEADER.split("{v}", 1)[0][len("fuse-dm: "):],
+                     T3Machine.DETAILS, T3Machine.NO_RESULT, *T3Machine.QUICK_FAILED.split("{rc}"))
+        for fragment in fragments:
+            with self.subTest(fragment=fragment[:40]):
+                self.assertIn(fragment, bash)
+                self.assertIn(ascii_dash(fragment), text)
+        for where, body in (("bin/fuse-dm", bash), (PS1.name, text)):
+            with self.subTest(script=where):
+                self.assertNotIn("re-checking the environment first, seconds", body)
+
+    def test_ps1_help_says_the_quick_check(self):
+        """OPX-2020 AC6, the ps1 half of NoSecondsClaim: Show-Help names the quick check, its log and FUSE_DM_HOLD, and
+        claims no seconds."""
+        text = ps1_text()
+        start = text.index("function Show-Help {")
+        body = text[start:text.index("\n}\n", start)]
+        self.assertNotIn("seconds", body)
+        for token in ("last-pass.log", "quick check", "FUSE_DM_HOLD"):
+            with self.subTest(token=token):
+                self.assertIn(token, body)
 
 
 class Hygiene(unittest.TestCase):
