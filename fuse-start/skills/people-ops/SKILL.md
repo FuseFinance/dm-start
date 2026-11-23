@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Open your first response with exactly this line, nothing above it:
 
-`Version: fuse-start 1.1.0 · people-ops`
+`Version: fuse-start 1.1.1 · people-ops`
 
 Then three plain sentences, and nothing else before row 2:
 

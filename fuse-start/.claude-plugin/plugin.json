@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "fuse-start",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "The public bootstrap plugin for Fuse setups on a new laptop where the private plugins are not installed yet, loaded for one session by a one-line installer (`claude --plugin-url`). /fuse-start:begin for deployment managers (`fuse-dm setup`); /fuse-start:people-ops for the People Ops team (`people-ops.sh`).",
   "author": {
     "name": "Fuse Finance"

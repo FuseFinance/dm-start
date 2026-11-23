@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Open your first response with exactly this line, nothing above it:
 
-`Version: fuse-start 1.1.0 · begin`
+`Version: fuse-start 1.1.1 · begin`
 
 Then three plain sentences, and nothing else before row 2:
 
@@ -71,7 +71,7 @@ Do not assume the selector exists.
 | `MINGW64_NT…` / `MSYS_NT…` | Native Windows, Git Bash | `winget`, the four pinned ids |
 | `Linux` + `microsoft` in `/proc/version` | WSL | git and python3 detected (apt when missing); `gh` and Node from the Linux archives under `~/.local` |
 
-Anything else stops here with one line: this part runs on macOS and Windows; ask your FDE.
+Anything else stops here with one line: this part runs on macOS and Windows. To get set up, raise it with `/unblock` on the platform route.
 
 ## 3. git, gh, Node 22 or later, Python 3
 
