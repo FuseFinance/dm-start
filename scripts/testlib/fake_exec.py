@@ -19,6 +19,13 @@ stub already linked to the damaged inode keeps it.) Test "present but not execut
     write_exec(bin / "tool", "#!/bin/sh\\necho \\"$*\\" >> calls\\nexit 0\\n")
 
 `FAKE_EXEC_SHIM_DIR` moves the shim cache (tests of this module; CI).
+
+Windows (no shebangs, no hard-linked shims): `write_exec` writes `<path>.body` and `<path>.cmd`, which
+CreateProcess-by-`shutil.which` and cmd.exe's PATHEXT find for `<path>`. A shell body is sourced by Git
+Bash's `sh.exe`, named by its absolute path (`FAKE_EXEC_SH` overrides it; never `bash` from PATH, never
+WSL), with `$0` the stub path without `.cmd`; a Python body runs under this interpreter; the exit code
+passes through. An argument holding a double quote reaches a shell body with backslashes around it
+(cmd.exe and MSYS quote differently); assert on the rest of such an argument.
 """
 from __future__ import annotations
 
@@ -26,6 +33,7 @@ import hashlib
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 DEFAULT_INTERPRETER = "/bin/sh"
@@ -67,8 +75,31 @@ def shim_for(interpreter: str) -> Path:
     return target
 
 
+WINDOWS_SH = r"C:\Program Files\Git\usr\bin\sh.exe"
+
+
+def _write_exec_win32(path: Path, body: str, interpreter: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.with_name(path.name + ".body").write_bytes(body.encode("utf-8"))  # LF kept: sh reads it as written
+    sh = os.environ.get("FAKE_EXEC_SH") or WINDOWS_SH
+    name = interpreter.split()[-1].rsplit("/", 1)[-1]
+    if name.startswith("python"):
+        run = f'"{sys.executable}" "%~dpn0.body" %*'
+    else:
+        shell = str(Path(sh).with_name("bash.exe")) if name == "bash" else sh
+        # MSYS parses its command line with single quotes as quotes, and no backslash escapes
+        script = '. "$0.body"' if name in _SHELLS else f'exec {interpreter} "$0.body" "$@"'
+        run = f'"{shell}" -c \'{script}\' "%~dpn0" %*'
+    # MSYS=noglob: sh.exe must not glob-expand the arguments cmd.exe hands it.
+    text = f"@echo off\r\nsetlocal\r\nset MSYS=noglob\r\n{run}\r\nexit /b %ERRORLEVEL%\r\n"
+    path.with_name(path.name + ".cmd").write_bytes(text.encode("utf-8"))
+    return path
+
+
 def write_exec(path, body: str, *, interpreter: str | None = None) -> Path:
     path = Path(path)
+    if sys.platform == "win32":
+        return _write_exec_win32(path, body, interpreter or interpreter_for(body))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.with_name(path.name + ".body").write_text(body)
     if path.is_symlink() or path.exists():
